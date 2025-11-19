@@ -253,10 +253,6 @@ PAGE = r"""
           7 SQL-style operations implemented using our own CSV parser & in-memory dataframe.
         </div>
       </div>
-      <div class="tag">
-        <span>●</span>
-        <span>CSVParser · No pandas/csv/json</span>
-      </div>
     </div>
 
     <div class="grid">
