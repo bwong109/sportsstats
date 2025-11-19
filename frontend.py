@@ -1,13 +1,12 @@
-# frontend.py
-from flask import Flask, request, render_template_string, session, jsonify
-from csv_parser import CSVParser
+from flask import Flask, request, render_template, session, jsonify
+from csv_parser import CSVParser 
 import time
 import os
 import glob
 import threading
 
 APP = Flask(__name__)
-APP.secret_key = 'csv-parser-secret-key-2024'
+APP.secret_key = 'csv-parser-secret-key-2024' 
 
 DATA_FOLDER = "data"
 parsers = {}
@@ -161,12 +160,10 @@ def apply_filters(data, filters, schema):
 
 
 def apply_aggregation(data, aggregation_column, aggregation_function, group_by_column):
-    # If only group_by is specified without aggregation, do GROUP BY only
     if group_by_column and (not aggregation_column or not aggregation_function):
         if not data:
             return data, None
         
-        # Create a dictionary to track unique combinations
         seen = {}
         grouped_data = []
         
@@ -178,7 +175,6 @@ def apply_aggregation(data, aggregation_column, aggregation_function, group_by_c
         
         return grouped_data, f"Grouped by {group_by_column}"
     
-    # If no aggregation column or function, return data as-is
     if not aggregation_column or not aggregation_function:
         return data, None
     
@@ -255,9 +251,7 @@ def execute_query(p, state):
         working_data = temp_parser.filter_columns(state['selected_columns'])
         columns = state['selected_columns']
 
-    # Check if we have aggregation or just GROUP BY
     if state.get('aggregation_column') and state.get('aggregation_function'):
-        # Full aggregation with function
         working_data, aggregation_info = apply_aggregation(
             working_data,
             state['aggregation_column'],
@@ -267,7 +261,6 @@ def execute_query(p, state):
         if working_data:
             columns = list(working_data[0].keys())
     elif state.get('aggregation_group_by'):
-        # GROUP BY only, no aggregation function
         working_data, aggregation_info = apply_aggregation(
             working_data,
             None,
@@ -277,7 +270,6 @@ def execute_query(p, state):
         if working_data:
             columns = list(working_data[0].keys())
 
-    # Apply limit if enabled
     total_rows = len(working_data)
     if state.get('use_limit', True) and state.get('limit'):
         limit = int(state['limit'])
@@ -303,7 +295,7 @@ def get_dataset_columns(dataset_name):
         filepath = os.path.join(DATA_FOLDER, dataset_name)
         if os.path.exists(filepath):
             temp_parser = CSVParser(filepath)
-            temp_parser.parse(type_inference=True)
+            temp_parser.parse(type_inference=True) 
             columns = list(temp_parser.get_schema().keys())
             return jsonify({'columns': columns})
     except Exception:
@@ -324,825 +316,16 @@ def load_dataset():
     if not os.path.exists(filepath):
         return jsonify({'error': 'Dataset not found'}), 404
     
-    thread = threading.Thread(target=load_dataset_with_progress, args=(filepath, dataset_name))
-    thread.start()
-    thread.join()  # Wait for loading to complete
+    load_dataset_with_progress(filepath, dataset_name)
     
     return jsonify({'status': 'complete', 'dataset': dataset_name})
-
-PAGE_TEMPLATE = r"""
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>Sports Statistics</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <style>
-    * {
-      box-sizing: border-box;
-      margin: 0;
-      padding: 0;
-    }
-
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background: #f5f5f5;
-      color: #333;
-      line-height: 1.6;
-    }
-
-    .header {
-      background: white;
-      border-bottom: 2px solid #e0e0e0;
-      padding: 20px;
-      margin-bottom: 20px;
-    }
-
-    .header h1 {
-      font-size: 24px;
-      font-weight: 600;
-      margin-bottom: 15px;
-    }
-
-    .dataset-selector {
-      display: flex;
-      gap: 10px;
-      align-items: center;
-    }
-
-    .container {
-      max-width: 1400px;
-      margin: 0 auto;
-      padding: 20px;
-    }
-
-    .grid {
-      display: grid;
-      grid-template-columns: 2fr 1fr;
-      gap: 20px;
-    }
-
-    @media (max-width: 1024px) {
-      .grid {
-        grid-template-columns: 1fr;
-      }
-    }
-
-    .card {
-      background: white;
-      border: 1px solid #e0e0e0;
-      border-radius: 8px;
-      padding: 20px;
-    }
-
-    .card-title {
-      font-size: 18px;
-      font-weight: 600;
-      margin-bottom: 15px;
-      padding-bottom: 10px;
-      border-bottom: 1px solid #e0e0e0;
-    }
-
-    .form-group {
-      margin-bottom: 15px;
-    }
-
-    .form-label {
-      display: block;
-      font-size: 13px;
-      font-weight: 500;
-      margin-bottom: 5px;
-    }
-
-    .form-input, .form-select {
-      width: 100%;
-      padding: 8px 10px;
-      border: 1px solid #ddd;
-      border-radius: 4px;
-      font-size: 14px;
-    }
-
-    .form-input:focus, .form-select:focus {
-      outline: none;
-      border-color: #4a90e2;
-    }
-
-    .btn {
-      padding: 8px 16px;
-      border: none;
-      border-radius: 4px;
-      font-size: 14px;
-      cursor: pointer;
-      transition: background 0.2s;
-    }
-
-    .btn-primary {
-      background: #4a90e2;
-      color: white;
-    }
-
-    .btn-primary:hover {
-      background: #357abd;
-    }
-
-    .btn-secondary {
-      background: #f0f0f0;
-      color: #333;
-    }
-
-    .btn-secondary:hover {
-      background: #e0e0e0;
-    }
-
-    .btn-success {
-      background: #5cb85c;
-      color: white;
-    }
-
-    .btn-success:hover {
-      background: #4cae4c;
-    }
-
-    .btn-danger {
-      background: #d9534f;
-      color: white;
-    }
-
-    .btn-danger:hover {
-      background: #c9302c;
-    }
-
-    .tabs {
-      display: flex;
-      gap: 5px;
-      border-bottom: 1px solid #e0e0e0;
-      margin-bottom: 20px;
-    }
-
-    .tab-btn {
-      padding: 10px 15px;
-      border: none;
-      background: transparent;
-      cursor: pointer;
-      font-size: 14px;
-      color: #666;
-      border-bottom: 2px solid transparent;
-      margin-bottom: -1px;
-    }
-
-    .tab-btn.active {
-      color: #4a90e2;
-      border-bottom-color: #4a90e2;
-    }
-
-    .tab-content {
-      display: none;
-    }
-
-    .tab-content.active {
-      display: block;
-    }
-
-    .form-row {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 10px;
-    }
-
-    .form-row-3 {
-      display: grid;
-      grid-template-columns: 2fr 1fr 2fr;
-      gap: 10px;
-    }
-
-    .filter-list {
-      border: 1px solid #e0e0e0;
-      border-radius: 4px;
-      padding: 10px;
-      background: #fafafa;
-      margin-bottom: 15px;
-    }
-
-    .filter-item {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      padding: 8px;
-      background: white;
-      border: 1px solid #e0e0e0;
-      border-radius: 4px;
-      margin-bottom: 8px;
-      font-size: 13px;
-    }
-
-    .filter-item:last-child {
-      margin-bottom: 0;
-    }
-
-    .remove-btn {
-      background: #f0f0f0;
-      color: #666;
-      border: none;
-      padding: 4px 8px;
-      border-radius: 3px;
-      font-size: 12px;
-      cursor: pointer;
-    }
-
-    .button-group {
-      display: flex;
-      gap: 10px;
-      margin-top: 15px;
-    }
-
-    .alert {
-      padding: 12px;
-      border-radius: 4px;
-      margin-top: 15px;
-      font-size: 14px;
-    }
-
-    .alert-success {
-      background: #d4edda;
-      color: #155724;
-      border: 1px solid #c3e6cb;
-    }
-
-    .alert-error {
-      background: #f8d7da;
-      color: #721c24;
-      border: 1px solid #f5c6cb;
-    }
-
-    .alert-info {
-      background: #d1ecf1;
-      color: #0c5460;
-      border: 1px solid #bee5eb;
-    }
-
-    .results-table-wrapper {
-      max-height: 500px;
-      overflow: auto;
-      margin-top: 15px;
-      border: 1px solid #e0e0e0;
-      border-radius: 4px;
-    }
-
-    .results-table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 13px;
-    }
-
-    .results-table th,
-    .results-table td {
-      padding: 10px;
-      text-align: left;
-      border-bottom: 1px solid #e0e0e0;
-    }
-
-    .results-table th {
-      background: #fafafa;
-      font-weight: 600;
-      position: sticky;
-      top: 0;
-    }
-
-    .results-table tbody tr:hover {
-      background: #f9f9f9;
-    }
-
-    .info-grid {
-      display: grid;
-      grid-template-columns: repeat(3, 1fr);
-      gap: 15px;
-      margin-bottom: 20px;
-    }
-
-    .info-item {
-      padding: 15px;
-      background: #fafafa;
-      border: 1px solid #e0e0e0;
-      border-radius: 4px;
-    }
-
-    .info-label {
-      font-size: 12px;
-      color: #666;
-      margin-bottom: 5px;
-    }
-
-    .info-value {
-      font-size: 20px;
-      font-weight: 600;
-    }
-
-    .schema-table {
-      width: 100%;
-      font-size: 13px;
-      border-collapse: collapse;
-    }
-
-    .schema-table th,
-    .schema-table td {
-      padding: 8px;
-      text-align: left;
-      border-bottom: 1px solid #e0e0e0;
-    }
-
-    .schema-table th {
-      background: #fafafa;
-      font-weight: 600;
-    }
-
-    .checkbox-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-      gap: 8px;
-      max-height: 200px;
-      overflow-y: auto;
-      border: 1px solid #e0e0e0;
-      border-radius: 4px;
-      padding: 10px;
-      background: #fafafa;
-    }
-
-    .checkbox-label {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      font-size: 13px;
-      cursor: pointer;
-    }
-
-    .query-summary {
-      background: #f0f8ff;
-      border: 1px solid #d0e8f7;
-      border-radius: 4px;
-      padding: 12px;
-      margin-bottom: 15px;
-      font-size: 13px;
-    }
-
-    .query-summary-title {
-      font-weight: 600;
-      margin-bottom: 8px;
-      color: #4a90e2;
-    }
-
-    .empty-state {
-      text-align: center;
-      padding: 40px;
-      color: #999;
-    }
-  </style>
-</head>
-<body>
-  <div class="header">
-    <h1>NBA Statistics</h1>
-    
-    <div class="dataset-selector">
-      <label class="form-label" style="margin: 0;">Dataset:</label>
-      <select id="datasetSelect" class="form-select" style="width: auto;">
-        <option value="">Choose Dataset</option>
-        {% for ds in available_datasets %}
-          <option value="{{ ds }}" {% if ds == current_dataset %}selected{% endif %}>{{ ds }}</option>
-        {% endfor %}
-      </select>
-      <button onclick="loadSelectedDataset()" class="btn btn-primary">Load</button>
-    </div>
-  </div>
-
-  <div class="container">
-    {% if not current_dataset %}
-    <div class="card">
-      <div class="empty-state">
-        <h2>Select a dataset to begin</h2>
-        <p>Choose a CSV file from the dropdown above</p>
-      </div>
-    </div>
-    {% else %}
-    <div class="grid">
-      <div class="card">
-        <h2 class="card-title">Query Builder</h2>
-
-        {% if query_state.filters or (not query_state.show_all_columns and query_state.selected_columns) or query_state.join_dataset or query_state.aggregation_column %}
-        <div class="query-summary">
-          <div class="query-summary-title">Active Query Settings</div>
-          {% if query_state.filters %}
-          <div>Filters: {{ query_state.filters|length }} active</div>
-          {% endif %}
-          {% if not query_state.show_all_columns and query_state.selected_columns %}
-          <div>Columns: {{ query_state.selected_columns|length }} selected</div>
-          {% endif %}
-          {% if query_state.join_dataset %}
-          <div>Join: {{ query_state.join_dataset }}</div>
-          {% endif %}
-          {% if query_state.aggregation_column and query_state.aggregation_function %}
-          <div>Aggregation: {{ query_state.aggregation_function.upper() }}({{ query_state.aggregation_column }})</div>
-          {% elif query_state.aggregation_group_by %}
-          <div>Group By: {{ query_state.aggregation_group_by }}</div>
-          {% endif %}
-          {% if query_state.use_limit %}
-          <div>Limit: {{ query_state.limit }} rows</div>
-          {% endif %}
-        </div>
-        {% endif %}
-
-        <div class="tabs">
-          <button class="tab-btn active" onclick="switchTab('filter')">Filter</button>
-          <button class="tab-btn" onclick="switchTab('columns')">Columns</button>
-          <button class="tab-btn" onclick="switchTab('aggregate')">Aggregate</button>
-          <button class="tab-btn" onclick="switchTab('join')">Join</button>
-          <button class="tab-btn" onclick="switchTab('limit')">Limit</button>
-        </div>
-
-        <div id="tab-filter" class="tab-content active">
-          {% if query_state.filters %}
-          <div class="filter-list">
-            {% for filter in query_state.filters %}
-            <div class="filter-item">
-              <span>{{ filter.column }} {{ filter.op }} {{ filter.value }}</span>
-              <form method="post" action="/?action=remove_filter" style="display: inline;">
-                <input type="hidden" name="filter_index" value="{{ loop.index0 }}">
-                <button type="submit" class="remove-btn">Remove</button>
-              </form>
-            </div>
-            {% endfor %}
-          </div>
-          {% else %}
-          <div style="padding: 10px; background: #fafafa; border-radius: 4px; margin-bottom: 15px; text-align: center; color: #999;">
-            No filters applied
-          </div>
-          {% endif %}
-
-          <form method="post" action="/?action=add_filter">
-            <div class="form-row-3">
-              <div class="form-group">
-                <label class="form-label">Column</label>
-                <select name="filter_column" class="form-select">
-                  {% for col in columns %}
-                    <option value="{{ col }}">{{ col }}</option>
-                  {% endfor %}
-                </select>
-              </div>
-              <div class="form-group">
-                <label class="form-label">Operator</label>
-                <select name="filter_op" class="form-select">
-                  <option value=">">></option>
-                  <option value=">=">≥</option>
-                  <option value="<"><</option>
-                  <option value="<=">≤</option>
-                  <option value="==">==</option>
-                  <option value="!=">≠</option>
-                </select>
-              </div>
-              <div class="form-group">
-                <label class="form-label">Value</label>
-                <input type="text" name="filter_value" class="form-input" placeholder="e.g., 30">
-              </div>
-            </div>
-            <div class="button-group">
-              <button type="submit" class="btn btn-success">Add Filter</button>
-              {% if query_state.filters %}
-              <button type="submit" formaction="/?action=clear_filters" class="btn btn-secondary">Clear All</button>
-              {% endif %}
-            </div>
-          </form>
-        </div>
-
-        <div id="tab-columns" class="tab-content">
-          <form method="post" action="/?action=update_columns">
-            <div class="form-group">
-              <label class="checkbox-label">
-                <input type="checkbox" name="show_all_columns" id="show_all_columns" 
-                       {% if query_state.show_all_columns %}checked{% endif %} onchange="toggleColumnSelection()">
-                Show All Columns
-              </label>
-            </div>
-            
-            <div id="columnSelection" {% if query_state.show_all_columns %}style="display:none"{% endif %}>
-              <div class="form-group">
-                <label class="form-label">Select Columns</label>
-                <div class="checkbox-grid">
-                  {% for col in columns %}
-                    <label class="checkbox-label">
-                      <input type="checkbox" name="selected_columns" value="{{ col }}" 
-                             {% if col in query_state.selected_columns %}checked{% endif %}>
-                      {{ col }}
-                    </label>
-                  {% endfor %}
-                </div>
-              </div>
-            </div>
-            
-            <div class="button-group">
-              <button type="submit" class="btn btn-primary">Apply</button>
-            </div>
-          </form>
-        </div>
-
-        <div id="tab-aggregate" class="tab-content">
-          <form method="post" action="/?action=update_aggregation">
-            <div class="form-group">
-              <label class="form-label">Group By</label>
-              <select name="aggregation_group_by" class="form-select">
-                <option value="">No Grouping</option>
-                {% for col in columns %}
-                  <option value="{{ col }}" {% if query_state.aggregation_group_by == col %}selected{% endif %}>{{ col }}</option>
-                {% endfor %}
-              </select>
-            </div>
-            <div class="form-group">
-              <label class="form-label">Function (Optional)</label>
-              <select name="aggregation_function" class="form-select">
-                <option value="">No Aggregation</option>
-                <option value="sum" {% if query_state.aggregation_function == 'sum' %}selected{% endif %}>SUM</option>
-                <option value="avg" {% if query_state.aggregation_function == 'avg' %}selected{% endif %}>AVERAGE</option>
-                <option value="max" {% if query_state.aggregation_function == 'max' %}selected{% endif %}>MAXIMUM</option>
-                <option value="min" {% if query_state.aggregation_function == 'min' %}selected{% endif %}>MINIMUM</option>
-                <option value="count" {% if query_state.aggregation_function == 'count' %}selected{% endif %}>COUNT</option>
-              </select>
-            </div>
-            <div class="form-group">
-              <label class="form-label">Column (Optional)</label>
-              <select name="aggregation_column" class="form-select">
-                <option value="">Select Column</option>
-                {% for col in columns %}
-                  <option value="{{ col }}" {% if query_state.aggregation_column == col %}selected{% endif %}>{{ col }}</option>
-                {% endfor %}
-              </select>
-            </div>
-            <div class="button-group">
-              <button type="submit" class="btn btn-success">Apply</button>
-              {% if query_state.aggregation_column or query_state.aggregation_group_by %}
-              <button type="submit" formaction="/?action=clear_aggregation" class="btn btn-secondary">Clear</button>
-              {% endif %}
-            </div>
-          </form>
-        </div>
-
-        <div id="tab-join" class="tab-content">
-          <form method="post" action="/?action=join_dataset">
-            <div class="form-group">
-              <label class="form-label">Join With</label>
-              <select name="join_dataset" id="joinDatasetSelect" class="form-select" onchange="loadJoinColumns()">
-                <option value="">Select Dataset</option>
-                {% for ds in available_datasets %}
-                  {% if ds != current_dataset %}
-                    <option value="{{ ds }}" {% if query_state.join_dataset == ds %}selected{% endif %}>{{ ds }}</option>
-                  {% endif %}
-                {% endfor %}
-              </select>
-            </div>
-            <div class="form-row">
-              <div class="form-group">
-                <label class="form-label">Left Column</label>
-                <select name="join_left_col" class="form-select">
-                  {% for col in schema.keys() %}
-                    <option value="{{ col }}" {% if query_state.join_left_col == col %}selected{% endif %}>{{ col }}</option>
-                  {% endfor %}
-                </select>
-              </div>
-              <div class="form-group">
-                <label class="form-label">Right Column</label>
-                <select name="join_right_col" id="joinRightCol" class="form-select">
-                  <option value="">Select Column</option>
-                </select>
-              </div>
-            </div>
-            <div class="button-group">
-              <button type="submit" class="btn btn-success">Apply Join</button>
-              {% if query_state.join_dataset %}
-              <button type="submit" formaction="/?action=clear_join" class="btn btn-secondary">Clear</button>
-              {% endif %}
-            </div>
-          </form>
-        </div>
-
-        <div id="tab-limit" class="tab-content">
-          <form method="post" action="/?action=update_limit">
-            <div class="form-group">
-              <label class="checkbox-label">
-                <input type="checkbox" name="use_limit" id="use_limit" 
-                       {% if query_state.use_limit %}checked{% endif %} onchange="toggleLimitInput()">
-                Enable Row Limit
-              </label>
-            </div>
-            
-            <div id="limitInput" {% if not query_state.use_limit %}style="display:none"{% endif %}>
-              <div class="form-group">
-                <label class="form-label">Number of Rows</label>
-                <input type="number" name="limit" class="form-input" 
-                       value="{{ query_state.limit }}" min="1" placeholder="50">
-              </div>
-            </div>
-            
-            <div class="button-group">
-              <button type="submit" class="btn btn-primary">Apply</button>
-            </div>
-          </form>
-        </div>
-
-        <div class="button-group" style="margin-top: 20px; padding-top: 20px; border-top: 1px solid #e0e0e0;">
-          <form method="post" action="/?action=execute_query" style="display: inline;">
-            <button type="submit" class="btn btn-primary">Run Query</button>
-          </form>
-          <form method="post" action="/?action=clear_all" style="display: inline;">
-            <button type="submit" class="btn btn-danger">Clear All</button>
-          </form>
-        </div>
-
-        {% if error %}
-          <div class="alert alert-error">{{ error }}</div>
-        {% endif %}
-
-        {% if success %}
-          <div class="alert alert-success">{{ success }}</div>
-        {% endif %}
-
-        {% if aggregation_info %}
-          <div class="alert alert-info">{{ aggregation_info }}</div>
-        {% endif %}
-
-        {% if results %}
-          <div class="results-table-wrapper">
-            <table class="results-table">
-              <thead>
-                <tr>
-                  {% for col in result_columns %}
-                    <th>{{ col }}</th>
-                  {% endfor %}
-                </tr>
-              </thead>
-              <tbody>
-                {% for row in results %}
-                  <tr>
-                    {% for col in result_columns %}
-                      <td>
-                        {% if row[col] is number %}
-                          {{ "%.2f"|format(row[col]) if row[col] is float else row[col] }}
-                        {% else %}
-                          {{ row[col] }}
-                        {% endif %}
-                      </td>
-                    {% endfor %}
-                  </tr>
-                {% endfor %}
-              </tbody>
-            </table>
-          </div>
-          <div style="margin-top: 10px; font-size: 13px; color: #666;">
-            Showing {{ results|length }} of {{ total_rows }} row(s) with {{ result_columns|length }} column(s)
-          </div>
-        {% endif %}
-      </div>
-
-      <div class="card">
-        <h2 class="card-title">Dataset Info</h2>
-        
-        <div class="info-grid">
-          <div class="info-item">
-            <div class="info-label">Rows</div>
-            <div class="info-value">{{ row_count }}</div>
-          </div>
-          <div class="info-item">
-            <div class="info-label">Columns</div>
-            <div class="info-value">{{ schema|length }}</div>
-          </div>
-          <div class="info-item">
-            <div class="info-label">Types</div>
-            <div class="info-value">{{ unique_types }}</div>
-          </div>
-        </div>
-
-        <h3 style="font-size: 16px; margin-bottom: 10px;">Schema</h3>
-        <div style="max-height: 400px; overflow-y: auto;">
-          <table class="schema-table">
-            <thead>
-              <tr>
-                <th>#</th>
-                <th>Column</th>
-                <th>Type</th>
-              </tr>
-            </thead>
-            <tbody>
-              {% for col_name, col_type in schema.items() %}
-                <tr>
-                  <td>{{ loop.index }}</td>
-                  <td>{{ col_name }}</td>
-                  <td>{{ col_type }}</td>
-                </tr>
-              {% endfor %}
-            </tbody>
-          </table>
-        </div>
-
-        {% if current_dataset and current_dataset in chunk_stats %}
-        <h3 style="font-size: 16px; margin: 20px 0 10px;">Loading Stats</h3>
-        <div style="font-size: 13px; color: #666; line-height: 1.8;">
-          <div><strong>Strategy:</strong> {{ chunk_stats[current_dataset].get('strategy', 'N/A').upper() }}</div>
-          <div><strong>Load Time:</strong> {{ "%.2f"|format(chunk_stats[current_dataset].get('load_time', 0)) }}s</div>
-          <div><strong>File Size:</strong> {{ "%.2f"|format(chunk_stats[current_dataset].get('file_size_mb', 0)) }}MB</div>
-        </div>
-        {% endif %}
-      </div>
-    </div>
-    {% endif %}
-  </div>
-
-  <script>
-    function switchTab(tabName) {
-      document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
-      document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
-      document.getElementById('tab-' + tabName).classList.add('active');
-      event.target.classList.add('active');
-    }
-
-    function toggleColumnSelection() {
-      const showAll = document.getElementById('show_all_columns').checked;
-      document.getElementById('columnSelection').style.display = showAll ? 'none' : 'block';
-    }
-
-    function toggleLimitInput() {
-      const useLimit = document.getElementById('use_limit').checked;
-      document.getElementById('limitInput').style.display = useLimit ? 'block' : 'none';
-    }
-
-    function loadJoinColumns() {
-      const dataset = document.getElementById('joinDatasetSelect').value;
-      const rightColSelect = document.getElementById('joinRightCol');
-      
-      rightColSelect.innerHTML = '<option value="">Loading...</option>';
-      
-      if (!dataset) {
-        rightColSelect.innerHTML = '<option value="">Select Column</option>';
-        return;
-      }
-      
-      fetch('/api/dataset_columns/' + dataset)
-        .then(response => response.json())
-        .then(data => {
-          rightColSelect.innerHTML = '<option value="">Select Column</option>';
-          data.columns.forEach(col => {
-            const option = document.createElement('option');
-            option.value = col;
-            option.textContent = col;
-            {% if query_state.join_right_col %}
-            if (col === '{{ query_state.join_right_col }}') {
-              option.selected = true;
-            }
-            {% endif %}
-            rightColSelect.appendChild(option);
-          });
-        });
-    }
-
-    function loadSelectedDataset() {
-      const select = document.getElementById('datasetSelect');
-      const dataset = select.value;
-      
-      if (!dataset) {
-        alert('Please select a dataset');
-        return;
-      }
-
-      // Show loading message
-      const btn = event.target;
-      btn.disabled = true;
-      btn.textContent = 'Loading...';
-
-      fetch('/api/load_dataset', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({dataset: dataset})
-      })
-      .then(response => response.json())
-      .then(data => {
-        window.location.href = '/?dataset=' + dataset;
-      })
-      .catch(error => {
-        btn.disabled = false;
-        btn.textContent = 'Load';
-        alert('Error loading dataset: ' + error);
-      });
-    }
-
-    document.addEventListener('DOMContentLoaded', function() {
-      {% if query_state.join_dataset %}
-      loadJoinColumns();
-      {% endif %}
-    });
-  </script>
-</body>
-</html>
-"""
 
 
 @APP.route("/", methods=["GET", "POST"])
 def index():
     global active_dataset
     error = None
+    success = None
     
     new_dataset = request.args.get('dataset')
     if new_dataset:
@@ -1186,8 +369,8 @@ def index():
             'limit': 50,
             'use_limit': True
         }
-        return render_template_string(
-            PAGE_TEMPLATE,
+        return render_template(
+            'index.html',
             available_datasets=available_datasets,
             current_dataset=None,
             chunk_stats={},
@@ -1209,8 +392,6 @@ def index():
     schema = p.get_schema()
     unique_types = len(set(schema.values()))
     
-    error = None
-    success = None
     aggregation_info = None
     results = []
     result_columns = []
@@ -1288,7 +469,7 @@ def index():
                 if join_ds and join_left and join_right:
                     if join_ds not in parsers:
                         filepath = os.path.join(DATA_FOLDER, join_ds)
-                        load_dataset_with_progress(filepath, join_ds)
+                        load_dataset_with_progress(filepath, join_ds) 
                     
                     query_state['join_dataset'] = join_ds
                     query_state['join_left_col'] = join_left
@@ -1326,7 +507,7 @@ def index():
             
         except Exception as e:
             error = f"Error: {str(e)}"
-    
+
     if not error:
         results, result_columns, aggregation_info, working_schema, total_rows = execute_query(p, query_state)
     else:
@@ -1338,8 +519,8 @@ def index():
     
     columns = list(working_schema.keys()) if working_schema else list(schema.keys())
     
-    return render_template_string(
-        PAGE_TEMPLATE,
+    return render_template(
+        'index.html',
         available_datasets=available_datasets,
         current_dataset=active_dataset,
         chunk_stats=chunk_stats,
