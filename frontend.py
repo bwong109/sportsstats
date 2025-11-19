@@ -3,7 +3,8 @@ Enhanced Flask Web Application for CSVParser
 Features:
 - Multiple dataset loading with live chunk progress
 - Multiple filters support  
-- Dataset join functionality
+- Dataset join functionality with dynamic column loading
+- Aggregation functionality (sum, avg, max, min, count)
 - Performance optimizations with caching
 - Dynamic chunk size based on file size
 """
@@ -119,7 +120,10 @@ def get_query_state():
             'show_all_columns': True,
             'join_dataset': '',
             'join_left_col': '',
-            'join_right_col': ''
+            'join_right_col': '',
+            'aggregation_column': '',
+            'aggregation_function': '',
+            'aggregation_group_by': ''
         }
     
     # Ensure all keys exist (for backwards compatibility)
@@ -132,7 +136,10 @@ def get_query_state():
         'show_all_columns': True,
         'join_dataset': '',
         'join_left_col': '',
-        'join_right_col': ''
+        'join_right_col': '',
+        'aggregation_column': '',
+        'aggregation_function': '',
+        'aggregation_group_by': ''
     }
     
     for key, default_value in defaults.items():
@@ -191,10 +198,49 @@ def apply_filters(data, filters, schema):
     return filtered_data
 
 
+def apply_aggregation(data, aggregation_column, aggregation_function, group_by_column):
+    """Apply aggregation to the data"""
+    if not aggregation_column or not aggregation_function:
+        return data, None
+    
+    # Create a temporary parser for aggregation
+    temp_parser = CSVParser.__new__(CSVParser)
+    temp_parser.data = data
+    
+    # Set up schema for the aggregation
+    if data:
+        schema = {}
+        for col in data[0].keys():
+            schema[col] = "string"  # Default type
+        temp_parser.schema = schema
+    
+    try:
+        if group_by_column:
+            # Grouped aggregation
+            result = temp_parser.aggregate(group_by_column, aggregation_column, aggregation_function)
+            # Convert to list of dicts for display
+            aggregated_data = []
+            for group_val, agg_val in result.items():
+                aggregated_data.append({
+                    group_by_column: group_val,
+                    f"{aggregation_function}({aggregation_column})": agg_val
+                })
+            return aggregated_data, f"{aggregation_function.upper()} of {aggregation_column} grouped by {group_by_column}"
+        else:
+            # Global aggregation
+            result = temp_parser.aggregate(None, aggregation_column, aggregation_function)
+            aggregated_data = [{f"{aggregation_function}({aggregation_column})": result}]
+            return aggregated_data, f"{aggregation_function.upper()} of {aggregation_column}"
+    except Exception as e:
+        print(f"Aggregation error: {e}")
+        return data, f"Aggregation error: {e}"
+
+
 def execute_query(p, state):
     """Execute the combined query with optimizations"""
     working_data = p.data
     columns = list(p.schema.keys())
+    aggregation_info = None
     
     # Ensure state has all required keys
     if not isinstance(state, dict):
@@ -212,14 +258,26 @@ def execute_query(p, state):
         working_data = temp_parser.filter_columns(state['selected_columns'])
         columns = state['selected_columns']
     
-    # Step 3: Apply sorting if exists
-    if state.get('sort_column'):
+    # Step 3: Apply aggregation if specified
+    if state.get('aggregation_column') and state.get('aggregation_function'):
+        working_data, aggregation_info = apply_aggregation(
+            working_data,
+            state['aggregation_column'],
+            state['aggregation_function'],
+            state.get('aggregation_group_by', '')
+        )
+        # Update columns based on aggregation result
+        if working_data:
+            columns = list(working_data[0].keys())
+    
+    # Step 4: Apply sorting if exists (and not aggregated)
+    if state.get('sort_column') and not aggregation_info:
         temp_parser = CSVParser.__new__(CSVParser)
         temp_parser.data = working_data
         temp_parser.schema = {k: v for k, v in p.schema.items() if k in columns}
         working_data = temp_parser.sort_data(state['sort_column'], reverse=(state.get('sort_order', 'desc') == 'desc'))
     
-    return working_data, columns
+    return working_data, columns, aggregation_info
 
 
 @APP.route("/api/loading_progress/<dataset_name>")
@@ -228,6 +286,27 @@ def get_loading_progress(dataset_name):
     if dataset_name in loading_progress:
         return jsonify(loading_progress[dataset_name])
     return jsonify({'status': 'not_found'})
+
+
+@APP.route("/api/dataset_columns/<dataset_name>")
+def get_dataset_columns(dataset_name):
+    """API endpoint to get columns of a specific dataset"""
+    if dataset_name in parsers:
+        columns = list(parsers[dataset_name].schema.keys())
+        return jsonify({'columns': columns})
+    
+    # If not loaded, try to load it temporarily to get schema
+    try:
+        filepath = os.path.join(DATA_FOLDER, dataset_name)
+        if os.path.exists(filepath):
+            temp_parser = CSVParser(filepath)
+            temp_parser.parse(type_inference=True)
+            columns = list(temp_parser.get_schema().keys())
+            return jsonify({'columns': columns})
+    except Exception as e:
+        pass
+    
+    return jsonify({'columns': []})
 
 
 @APP.route("/api/load_dataset", methods=["POST"])
@@ -575,6 +654,12 @@ PAGE_TEMPLATE = r"""
       border: 1px solid #bbf7d0;
     }
 
+    .alert-info {
+      background: #dbeafe;
+      color: #1e40af;
+      border: 1px solid #93c5fd;
+    }
+
     .results-card {
       margin-top: 20px;
       border: 1px solid var(--border);
@@ -759,7 +844,7 @@ PAGE_TEMPLATE = r"""
         <h2 class="card-title">Build Your Query</h2>
 
         <!-- Current Query Summary -->
-        {% if query_state.filters or query_state.sort_column or (not query_state.show_all_columns and query_state.selected_columns) or query_state.join_dataset %}
+        {% if query_state.filters or query_state.sort_column or (not query_state.show_all_columns and query_state.selected_columns) or query_state.join_dataset or query_state.aggregation_column %}
         <div class="current-query-box">
           <div class="current-query-title">🔍 Active Query Settings:</div>
           {% if query_state.filters %}
@@ -774,6 +859,9 @@ PAGE_TEMPLATE = r"""
           {% if query_state.join_dataset %}
           <div class="current-query-item">• Joined with: {{ query_state.join_dataset }}</div>
           {% endif %}
+          {% if query_state.aggregation_column %}
+          <div class="current-query-item">• Aggregation: {{ query_state.aggregation_function.upper() }}({{ query_state.aggregation_column }}){% if query_state.aggregation_group_by %} grouped by {{ query_state.aggregation_group_by }}{% endif %}</div>
+          {% endif %}
         </div>
         {% endif %}
 
@@ -781,6 +869,7 @@ PAGE_TEMPLATE = r"""
           <button class="tab-btn active" onclick="switchTab('filter')">📊 Filter Data</button>
           <button class="tab-btn" onclick="switchTab('columns')">📋 Select Columns</button>
           <button class="tab-btn" onclick="switchTab('sort')">⬆️ Sort Results</button>
+          <button class="tab-btn" onclick="switchTab('aggregate')">📈 Aggregate</button>
           <button class="tab-btn" onclick="switchTab('join')">🔗 Join Data</button>
         </div>
 
@@ -900,12 +989,67 @@ PAGE_TEMPLATE = r"""
           </form>
         </div>
 
+        <!-- Aggregate Tab -->
+        <div id="tab-aggregate" class="tab-content">
+          <form method="post" action="/?action=update_aggregation">
+            <div class="form-group">
+              <label class="form-label">Aggregation Function</label>
+              <select name="aggregation_function" class="form-select">
+                <option value="">-- No Aggregation --</option>
+                <option value="sum" {% if query_state.aggregation_function == 'sum' %}selected{% endif %}>SUM</option>
+                <option value="avg" {% if query_state.aggregation_function == 'avg' %}selected{% endif %}>AVERAGE</option>
+                <option value="max" {% if query_state.aggregation_function == 'max' %}selected{% endif %}>MAXIMUM</option>
+                <option value="min" {% if query_state.aggregation_function == 'min' %}selected{% endif %}>MINIMUM</option>
+                <option value="count" {% if query_state.aggregation_function == 'count' %}selected{% endif %}>COUNT</option>
+              </select>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label">Column to Aggregate</label>
+                <select name="aggregation_column" class="form-select">
+                  <option value="">-- Select Column --</option>
+                  {% for col in columns %}
+                    <option value="{{ col }}" {% if query_state.aggregation_column == col %}selected{% endif %}>{{ col }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label">Group By (Optional)</label>
+                <select name="aggregation_group_by" class="form-select">
+                  <option value="">-- No Grouping --</option>
+                  {% for col in columns %}
+                    <option value="{{ col }}" {% if query_state.aggregation_group_by == col %}selected{% endif %}>{{ col }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+            </div>
+            <div class="button-group">
+              <button type="submit" class="btn btn-success">📈 Apply Aggregation</button>
+              {% if query_state.aggregation_column %}
+              <button type="submit" formaction="/?action=clear_aggregation" class="btn btn-secondary">✕ Remove Aggregation</button>
+              {% endif %}
+            </div>
+          </form>
+          
+          {% if query_state.aggregation_column %}
+          <div style="margin-top: 16px; padding: 12px; background: #eff6ff; border-radius: 6px; border: 1px solid #bfdbfe;">
+            <div style="font-size: 12px; font-weight: 600; color: var(--primary); margin-bottom: 4px;">ℹ️ Aggregation Active</div>
+            <div style="font-size: 13px; color: var(--text);">
+              Function: {{ query_state.aggregation_function.upper() }}({{ query_state.aggregation_column }})
+              {% if query_state.aggregation_group_by %}
+              <br>Grouped by: {{ query_state.aggregation_group_by }}
+              {% endif %}
+            </div>
+          </div>
+          {% endif %}
+        </div>
+
         <!-- Join Tab -->
         <div id="tab-join" class="tab-content">
           <form method="post" action="/?action=join_dataset">
             <div class="form-group">
               <label class="form-label">Dataset to Join</label>
-              <select name="join_dataset" class="form-select">
+              <select name="join_dataset" id="joinDatasetSelect" class="form-select" onchange="loadJoinColumns()">
                 <option value="">-- Select Dataset --</option>
                 {% for ds in available_datasets %}
                   {% if ds != current_dataset %}
@@ -925,7 +1069,7 @@ PAGE_TEMPLATE = r"""
               </div>
               <div class="form-group">
                 <label class="form-label">Join On (Other Dataset)</label>
-                <select name="join_right_col" class="form-select">
+                <select name="join_right_col" id="joinRightCol" class="form-select">
                   <option value="">-- Select Column --</option>
                 </select>
               </div>
@@ -937,6 +1081,15 @@ PAGE_TEMPLATE = r"""
               {% endif %}
             </div>
           </form>
+          
+          {% if query_state.join_dataset %}
+          <div style="margin-top: 16px; padding: 12px; background: #eff6ff; border-radius: 6px; border: 1px solid #bfdbfe;">
+            <div style="font-size: 12px; font-weight: 600; color: var(--primary); margin-bottom: 4px;">🔗 Join Active</div>
+            <div style="font-size: 13px; color: var(--text);">
+              Joined with {{ query_state.join_dataset }} on {{ query_state.join_left_col }} = {{ query_state.join_right_col }}
+            </div>
+          </div>
+          {% endif %}
         </div>
 
         <div class="button-group" style="margin-top: 24px; padding-top: 24px; border-top: 1px solid var(--border);">
@@ -954,6 +1107,10 @@ PAGE_TEMPLATE = r"""
 
         {% if success %}
           <div class="alert alert-success">{{ success }}</div>
+        {% endif %}
+
+        {% if aggregation_info %}
+          <div class="alert alert-info">{{ aggregation_info }}</div>
         {% endif %}
 
         {% if results %}
@@ -1063,6 +1220,41 @@ PAGE_TEMPLATE = r"""
       document.getElementById('columnSelection').style.display = showAll ? 'none' : 'block';
     }
 
+    function loadJoinColumns() {
+      const dataset = document.getElementById('joinDatasetSelect').value;
+      const rightColSelect = document.getElementById('joinRightCol');
+      
+      // Clear existing options
+      rightColSelect.innerHTML = '<option value="">-- Loading columns... --</option>';
+      
+      if (!dataset) {
+        rightColSelect.innerHTML = '<option value="">-- Select Column --</option>';
+        return;
+      }
+      
+      // Fetch columns for the selected dataset
+      fetch('/api/dataset_columns/' + dataset)
+        .then(response => response.json())
+        .then(data => {
+          rightColSelect.innerHTML = '<option value="">-- Select Column --</option>';
+          data.columns.forEach(col => {
+            const option = document.createElement('option');
+            option.value = col;
+            option.textContent = col;
+            {% if query_state.join_right_col %}
+            if (col === '{{ query_state.join_right_col }}') {
+              option.selected = true;
+            }
+            {% endif %}
+            rightColSelect.appendChild(option);
+          });
+        })
+        .catch(error => {
+          console.error('Error loading columns:', error);
+          rightColSelect.innerHTML = '<option value="">-- Error loading columns --</option>';
+        });
+    }
+
     function loadSelectedDataset() {
       const select = document.getElementById('datasetSelect');
       const dataset = select.value;
@@ -1115,6 +1307,13 @@ PAGE_TEMPLATE = r"""
         }, 500);
       });
     }
+
+    // Load join columns on page load if join dataset is already selected
+    document.addEventListener('DOMContentLoaded', function() {
+      {% if query_state.join_dataset %}
+      loadJoinColumns();
+      {% endif %}
+    });
   </script>
 </body>
 </html>
@@ -1123,7 +1322,7 @@ PAGE_TEMPLATE = r"""
 
 @APP.route("/", methods=["GET", "POST"])
 def index():
-    """Main route with multi-dataset support and multiple filters"""
+    """Main route with multi-dataset support, multiple filters, and aggregation"""
     global active_dataset
     
     # Get or set active dataset
@@ -1146,7 +1345,10 @@ def index():
             'show_all_columns': True,
             'join_dataset': '',
             'join_left_col': '',
-            'join_right_col': ''
+            'join_right_col': '',
+            'aggregation_column': '',
+            'aggregation_function': '',
+            'aggregation_group_by': ''
         }
         return render_template_string(
             PAGE_TEMPLATE,
@@ -1156,6 +1358,7 @@ def index():
             query_state=empty_query_state,
             error=None,
             success=None,
+            aggregation_info=None,
             results=[],
             result_columns=[],
             columns=[],
@@ -1172,6 +1375,7 @@ def index():
     
     error = None
     success = None
+    aggregation_info = None
     results = []
     result_columns = []
     
@@ -1224,6 +1428,20 @@ def index():
                 session.modified = True
                 success = "Sorting removed"
                 
+            elif action == "update_aggregation":
+                query_state['aggregation_function'] = request.form.get("aggregation_function", "")
+                query_state['aggregation_column'] = request.form.get("aggregation_column", "")
+                query_state['aggregation_group_by'] = request.form.get("aggregation_group_by", "")
+                session.modified = True
+                success = "Aggregation updated"
+                
+            elif action == "clear_aggregation":
+                query_state['aggregation_function'] = ""
+                query_state['aggregation_column'] = ""
+                query_state['aggregation_group_by'] = ""
+                session.modified = True
+                success = "Aggregation removed"
+                
             elif action == "join_dataset":
                 join_ds = request.form.get("join_dataset")
                 join_left = request.form.get("join_left_col")
@@ -1266,7 +1484,10 @@ def index():
                         'show_all_columns': True,
                         'join_dataset': '',
                         'join_left_col': '',
-                        'join_right_col': ''
+                        'join_right_col': '',
+                        'aggregation_column': '',
+                        'aggregation_function': '',
+                        'aggregation_group_by': ''
                     }
                     session.modified = True
                     query_state = get_query_state()
@@ -1274,14 +1495,14 @@ def index():
             
             # Execute query
             if action != "join_dataset":
-                results, result_columns = execute_query(p, query_state)
+                results, result_columns, aggregation_info = execute_query(p, query_state)
                 
         except Exception as e:
             error = f"Error: {str(e)}"
     
     # Default: show results with current query state
     if not results and not error:
-        results, result_columns = execute_query(p, query_state)
+        results, result_columns, aggregation_info = execute_query(p, query_state)
     
     return render_template_string(
         PAGE_TEMPLATE,
@@ -1291,6 +1512,7 @@ def index():
         query_state=query_state,
         error=error,
         success=success,
+        aggregation_info=aggregation_info,
         results=results,
         result_columns=result_columns,
         columns=columns,
