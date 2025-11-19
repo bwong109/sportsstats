@@ -1,39 +1,27 @@
-# main.py
 import os
 import csv
 import sqlite3
 import itertools
 from flask import Flask, request, render_template_string
 
-# -----------------------------
-# Config
-# -----------------------------
 APP = Flask(__name__)
 
-CSV_PATH = "database_24_25.csv"   # your CSV file
-DB_PATH = "stats.db"              # SQLite DB file
-TABLE_NAME = "stats"              # table name in SQLite
+CSV_PATH = "database_24_25.csv"  
+DB_PATH = "stats.db"              
+TABLE_NAME = "stats"              
 
 
-# -----------------------------
-# DB helpers
-# -----------------------------
 def get_db():
     conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row  # rows behave like dicts
+    conn.row_factory = sqlite3.Row  
     return conn
 
 
 def infer_sql_type(values):
-    """
-    Infer a SQLite type from sample column values.
-    Try INTEGER -> REAL -> TEXT.
-    """
     non_empty = [v for v in values if v not in (None, "", "NA", "N/A")]
     if not non_empty:
         return "TEXT"
 
-    # Try integer
     try:
         for v in non_empty:
             int(v)
@@ -41,7 +29,6 @@ def infer_sql_type(values):
     except ValueError:
         pass
 
-    # Try float
     try:
         for v in non_empty:
             float(v)
@@ -53,34 +40,25 @@ def infer_sql_type(values):
 
 
 def build_db():
-    """
-    Build (or rebuild) the SQLite DB from the CSV.
-    Drops the table if it exists, then recreates and inserts all rows.
-    """
     if not os.path.exists(CSV_PATH):
         raise FileNotFoundError(f"CSV file not found at {CSV_PATH}")
 
     conn = get_db()
     cur = conn.cursor()
 
-    # Drop old table
     cur.execute(f'DROP TABLE IF EXISTS "{TABLE_NAME}"')
 
-    # Read CSV
     with open(CSV_PATH, newline="", encoding="utf-8") as f:
         reader = csv.reader(f)
         header = next(reader)
         rows = list(reader)
 
-    # Infer column types using up to first 200 rows
     sample_rows = rows[:200]
-    # transpose: list of columns -> list of lists of values
     cols_values = list(zip(*sample_rows)) if sample_rows else [[] for _ in header]
     col_types = [
         infer_sql_type(col_vals) for col_vals in cols_values
     ]
 
-    # CREATE TABLE statement
     col_defs = []
     for name, ctype in zip(header, col_types):
         safe_name = name.replace('"', '""')
@@ -88,7 +66,6 @@ def build_db():
     create_sql = f'CREATE TABLE "{TABLE_NAME}" ({", ".join(col_defs)})'
     cur.execute(create_sql)
 
-    # INSERT rows
     placeholders = ", ".join(["?"] * len(header))
     columns_sql = ", ".join(f'"{h.replace(chr(34), chr(34)*2)}"' for h in header)
     insert_sql = f'INSERT INTO "{TABLE_NAME}" ({columns_sql}) VALUES ({placeholders})'
@@ -110,9 +87,6 @@ def get_schema_and_count():
     return row_count, schema_info
 
 
-# -----------------------------
-# HTML template
-# -----------------------------
 PAGE_TEMPLATE = r"""
 <!doctype html>
 <html lang="en">
@@ -587,15 +561,10 @@ PAGE_TEMPLATE = r"""
 </html>
 """
 
-
-# -----------------------------
-# Routes
-# -----------------------------
 @APP.route("/", methods=["GET", "POST"])
 def index():
     row_count, schema_info = get_schema_and_count()
 
-    # Convert pragma rows into friendly dicts
     schema = [
         {"name": col[1], "type": col[2]}
         for col in schema_info
@@ -631,7 +600,6 @@ def index():
             except sqlite3.Error as e:
                 error = f"SQL error: {e}"
 
-    # Example queries (you can tweak labels / SQL)
     examples = [
         {
             "label": "Top 10 scorers (PTS)",
@@ -669,11 +637,6 @@ def index():
     )
 
 
-# -----------------------------
-# Entry point
-# -----------------------------
 if __name__ == "__main__":
-    # Always rebuild DB on start so it stays in sync with the CSV.
     build_db()
-    # Run Flask dev server
     APP.run(debug=True)
