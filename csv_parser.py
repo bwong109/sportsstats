@@ -390,37 +390,42 @@ class CSVParser:
     def join(self, other_data: List[Dict], left_on: str, right_on: str) -> List[Dict]:
         """
         Perform an inner join with another dataset.
-        
-        Example:
-            team_data = other_parser.get_data()
-            joined = parser.join(team_data, left_on='Tm', right_on='TeamCode')
-            
+
         Args:
             other_data: List of dictionaries to join with
             left_on: Column name in this dataset to join on
             right_on: Column name in other dataset to join on
-            
+
         Returns:
             List of merged dictionaries (inner join)
         """
+        if not other_data or not self.data:
+            return []
+
         # Build index for right dataset
-        right_index = {}
+        right_index: Dict[object, List[Dict]] = {}
         for row in other_data:
+            # Skip rows that don't have the right join key
+            if right_on not in row:
+                continue
             key = row[right_on]
             if key not in right_index:
                 right_index[key] = []
             right_index[key].append(row)
-        
+
         # Perform join
-        joined = []
+        joined: List[Dict] = []
         for row in self.data:
+            # Skip rows that don't have the left join key
+            if left_on not in row:
+                continue
             key = row[left_on]
             if key in right_index:
                 for o_row in right_index[key]:
                     merged = row.copy()
                     merged.update(o_row)
                     joined.append(merged)
-        
+
         return joined
 
     # ----------------------------

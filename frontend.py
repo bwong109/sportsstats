@@ -357,7 +357,7 @@ def get_dataset_columns(dataset_name):
             temp_parser.parse(type_inference=True)
             columns = list(temp_parser.get_schema().keys())
             return jsonify({'columns': columns})
-    except Exception as e:
+    except Exception:
         pass
     
     return jsonify({'columns': []})
@@ -1372,12 +1372,33 @@ def index():
     """Main route with multi-dataset support, multiple filters, join, and aggregation"""
     global active_dataset
     
-    # Get or set active dataset
-    if request.args.get('dataset'):
-        active_dataset = request.args.get('dataset')
+    # Get or set active dataset, and reset query state if dataset changes
+    new_dataset = request.args.get('dataset')
+    if new_dataset:
+        previous_dataset = session.get('active_dataset')
+        active_dataset = new_dataset
         session['active_dataset'] = active_dataset
+
+        # If user switched to a different dataset, clear all query settings
+        if previous_dataset is None or previous_dataset != active_dataset:
+            session['query_state'] = {
+                'filters': [],
+                'selected_columns': [],
+                'sort_column': '',
+                'sort_order': 'desc',
+                'show_all_columns': True,
+                'join_dataset': '',
+                'join_left_col': '',
+                'join_right_col': '',
+                'aggregation_column': '',
+                'aggregation_function': '',
+                'aggregation_group_by': ''
+            }
+            session.modified = True
     elif 'active_dataset' in session:
         active_dataset = session['active_dataset']
+    else:
+        active_dataset = None
     
     # Get available datasets
     available_datasets = get_available_datasets()
@@ -1516,7 +1537,6 @@ def index():
                 success = "Join removed"
                 
             elif action == "execute_query":
-                # nothing special here; we just recompute using current state
                 success = "Query executed with current settings"
             
             elif action == "clear_all":
