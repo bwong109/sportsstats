@@ -1,5 +1,5 @@
 from flask import Flask, request, render_template_string
-from csv_parser import CSVParser  # uses your own parser to load data
+from csv_parser import CSVParser  
 
 # -----------------------------
 # App + DataFrame-style setup
@@ -8,12 +8,11 @@ APP = Flask(__name__)
 
 CSV_PATH = "data/database_24_25.csv"
 
-# Load entire CSV into memory as our "DataFrame"
 parser = CSVParser(CSV_PATH)
-parser.parse(type_inference=True)  # fills parser.data and parser.schema
+parser.parse(type_inference=True)  
 
-DATA = parser.get_data()           # list[dict]
-SCHEMA = parser.get_schema()       # dict[col -> type string]
+DATA = parser.get_data()          
+SCHEMA = parser.get_schema()       
 COLUMNS = list(SCHEMA.keys())
 
 
@@ -21,12 +20,10 @@ COLUMNS = list(SCHEMA.keys())
 # Helper: pretty display
 # -----------------------------
 def to_table_rows(list_of_dicts, cols=None):
-    """Return (columns, rows) for rendering. cols optional; if None, infer from first row."""
     if not list_of_dicts:
         return [], []
 
     if cols is None:
-        # Use keys from first row
         cols = list(list_of_dicts[0].keys())
 
     rows = []
@@ -36,7 +33,7 @@ def to_table_rows(list_of_dicts, cols=None):
 
 
 # -----------------------------
-# HTML template
+# HTML
 # -----------------------------
 PAGE = r"""
 <!doctype html>
@@ -455,7 +452,6 @@ def index():
                     min_pts = 0
 
                 def cond(row):
-                    # Use get with defaults in case column missing
                     row_team = str(row.get("Tm", "")).upper()
                     pts = row.get("PTS", 0)
                     if pts is None:
@@ -492,9 +488,7 @@ def index():
                 columns, rows = cols, rows_
 
             elif action == "avg_pts_by_team":
-                # uses CSVParser.aggregate with group_by
                 agg = parser.aggregate(group_by="Tm", target_col="PTS", func="avg")
-                # turn dict into list of dicts
                 rows_list = [{"Tm": k, "avg_PTS": round(v, 2) if v is not None else None}
                              for k, v in sorted(agg.items(), key=lambda kv: (kv[1] is None, -(kv[1] or 0)))]
                 cols, rows_ = to_table_rows(rows_list, cols=["Tm", "avg_PTS"])
@@ -502,10 +496,7 @@ def index():
                 columns, rows = cols, rows_
 
             elif action == "opp_stats":
-                # We'll compute COUNT and AVG using aggregate twice or manual
-                # First: group by Opp for PTS
                 agg = parser.aggregate(group_by="Opp", target_col="PTS", func="avg")
-                # Count games per Opp
                 counts = parser.aggregate(group_by="Opp", target_col="PTS", func="count")
                 rows_list = []
                 for opp in agg.keys():
@@ -520,9 +511,7 @@ def index():
                 columns, rows = cols, rows_
 
             elif action == "global_aggs":
-                # Demonstrate __getitem__ style and aggregate without group
-                pts_list = parser["PTS"]  # DataFrame-like access
-                # Use aggregate for consistency
+                pts_list = parser["PTS"] 
                 total_pts = parser.aggregate(group_by=None, target_col="PTS", func="sum")
                 avg_pts = parser.aggregate(group_by=None, target_col="PTS", func="avg")
                 count_rows = len(pts_list)
@@ -536,16 +525,13 @@ def index():
                 columns, rows = cols, rows_
 
             elif action == "join_teams":
-                # Small in-memory "teams" table to join with
                 teams_meta = [
                     {"Tm": "LAL", "Region": "West"},
                     {"Tm": "GSW", "Region": "West"},
                     {"Tm": "BOS", "Region": "East"},
                     {"Tm": "MIA", "Region": "East"},
-                    # add more if you like
                 ]
                 joined = parser.join(teams_meta, left_on="Tm", right_on="Tm")
-                # Only keep a few columns for display
                 simplified = []
                 for row in joined:
                     simplified.append({
