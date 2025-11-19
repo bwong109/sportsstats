@@ -1142,6 +1142,7 @@ PAGE_TEMPLATE = r"""
 @APP.route("/", methods=["GET", "POST"])
 def index():
     global active_dataset
+    error = None
     
     new_dataset = request.args.get('dataset')
     if new_dataset:
