@@ -1,18 +1,16 @@
 import os
-from typing import List, Dict, Optional, Callable, Generator
-
 
 class CSVParser:
     
-    def __init__(self, file_path: str, delimiter: str = ','):
+    def __init__(self, file_path, delimiter=','):
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"CSV file not found: {file_path}")
         self.file_path = file_path
         self.delimiter = delimiter
-        self.data: List[Dict] = []
-        self.schema: Dict[str, str] = {}
+        self.data = []
+        self.schema = {}
 
-    def _parse_csv_line(self, line: str) -> List[str]:
+    def _parse_csv_line(self, line):
         fields = []
         current_field = ""
         in_quotes = False
@@ -38,7 +36,7 @@ class CSVParser:
         fields.append(current_field)
         return fields
     
-    def _read_csv_file(self) -> tuple[List[str], List[List[str]]]:
+    def _read_csv_file(self):
         with open(self.file_path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
         
@@ -55,7 +53,7 @@ class CSVParser:
         
         return header, rows
 
-    def _infer_value_type(self, value: str):
+    def _infer_value_type(self, value):
         if value is None or value.strip() == "":
             return None
         value = value.strip()
@@ -98,7 +96,7 @@ class CSVParser:
         
         self.schema = col_types
 
-    def parse(self, type_inference: bool = True, chunk_size: Optional[int] = None) -> Optional[Generator[List[Dict], None, None]]:
+    def parse(self, type_inference=True, chunk_size=None):
         if chunk_size is None:
             header, rows = self._read_csv_file()
             
@@ -163,22 +161,22 @@ class CSVParser:
             
             return generator()
 
-    def __getitem__(self, col: str):
+    def __getitem__(self, col):
         if col not in self.schema:
             raise KeyError(f"Column {col} not found")
         return [row[col] for row in self.data]
 
-    def filter_rows(self, condition: Callable[[Dict], bool]) -> List[Dict]:
+    def filter_rows(self, condition):
         return [row for row in self.data if condition(row)]
 
-    def filter_columns(self, columns: List[str]) -> List[Dict]:
+    def filter_columns(self, columns):
         bad_cols = [c for c in columns if c not in self.schema]
         if bad_cols:
             raise ValueError(f"Columns not found in schema: {bad_cols}")
         return [{col: row[col] for col in columns} for row in self.data]
 
-    def aggregate(self, group_by: Optional[str], target_col: str, func: str):
-        if target_col not in self.schema:
+    def aggregate(self, group_by, target_col, func):
+        if target_col not in self.schema and target_col is not None:
             raise ValueError(f"Column {target_col} not found")
         if group_by and group_by not in self.schema:
             raise ValueError(f"Group by column {group_by} not found")
@@ -222,11 +220,11 @@ class CSVParser:
             else:
                 raise ValueError(f"Unsupported aggregation function: {func}")
 
-    def join(self, other_data: List[Dict], left_on: str, right_on: str) -> List[Dict]:
+    def join(self, other_data, left_on, right_on):
         if not other_data or not self.data:
             return []
 
-        right_index: Dict[object, List[Dict]] = {}
+        right_index = {}
         for row in other_data:
             if right_on not in row:
                 continue
@@ -235,7 +233,7 @@ class CSVParser:
                 right_index[key] = []
             right_index[key].append(row)
 
-        joined: List[Dict] = []
+        joined = []
         for row in self.data:
             if left_on not in row:
                 continue
@@ -248,13 +246,13 @@ class CSVParser:
 
         return joined
 
-    def get_data(self) -> List[Dict]:
+    def get_data(self):
         return self.data
 
-    def get_schema(self) -> Dict[str, str]:
+    def get_schema(self):
         return self.schema
 
-    def summary(self) -> Dict:
+    def summary(self):
         return {
             "file": self.file_path,
             "rows": len(self.data),
@@ -262,13 +260,3 @@ class CSVParser:
             "schema": self.schema,
             "sample_row": self.data[0] if self.data else None
         }
-    
-    def sort_data(self, column: str, reverse: bool = False) -> List[Dict]:
-        if column not in self.schema:
-            raise ValueError(f"Column {column} not found")
-        
-        return sorted(
-            self.data, 
-            key=lambda x: x[column] if x[column] is not None else float('-inf'),
-            reverse=reverse
-        )

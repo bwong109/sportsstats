@@ -1,3 +1,3 @@
-# Sports Analytics
+## NBA CSV Stats Explorer
 
-This project builds a custom sports analytics engine capable of parsing both structured (CSV) game statistics and semi-structured (JSON) betting and metadata files. The system will support SQL-like operations—including filtering, projection, aggregation, and joins—to allow users to query player performance, team trends, and betting insights. The final tool will include a command-line interface where users can run analytical queries on the integrated dataset. Development is divided between implementing custom parsers, building core query operations, and integrating everything into a functional analytics engine for the final demo.
+Interactive web app for exploring NBA stats CSVs with filtering, group-bys, aggregation, and joins.

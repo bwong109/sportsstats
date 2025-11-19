@@ -1,3 +1,4 @@
+# frontend.py
 from flask import Flask, request, render_template_string, session, jsonify
 from csv_parser import CSVParser
 import time
@@ -81,8 +82,6 @@ def get_query_state():
         session['query_state'] = {
             'filters': [],
             'selected_columns': [],
-            'sort_column': '',
-            'sort_order': 'desc',
             'show_all_columns': True,
             'join_dataset': '',
             'join_left_col': '',
@@ -98,8 +97,6 @@ def get_query_state():
     defaults = {
         'filters': [],
         'selected_columns': [],
-        'sort_column': '',
-        'sort_order': 'desc',
         'show_all_columns': True,
         'join_dataset': '',
         'join_left_col': '',
@@ -218,6 +215,10 @@ def execute_query(p, state):
     aggregation_info = None
     working_schema = p.schema
 
+    state['selected_columns'] = [
+        c for c in state['selected_columns']
+        if c in working_schema
+      ] 
     join_ds = state.get('join_dataset')
     join_left = state.get('join_left_col')
     join_right = state.get('join_right_col')
@@ -276,42 +277,6 @@ def execute_query(p, state):
         if working_data:
             columns = list(working_data[0].keys())
 
-    if state.get('sort_column') and not aggregation_info:
-        temp_parser = CSVParser.__new__(CSVParser)
-        temp_parser.data = working_data
-
-        temp_schema_parser = CSVParser.__new__(CSVParser)
-        temp_schema_parser.data = working_data
-        if working_data:
-            temp_schema_parser._infer_schema_all_rows()
-            temp_parser.schema = temp_schema_parser.schema
-        else:
-            temp_parser.schema = working_schema
-
-        working_data = temp_parser.sort_data(
-            state['sort_column'],
-            reverse=(state.get('sort_order', 'desc') == 'desc')
-        )
-    elif state.get('sort_column') and aggregation_info:
-        # Allow sorting even with aggregation/grouping
-        temp_parser = CSVParser.__new__(CSVParser)
-        temp_parser.data = working_data
-
-        temp_schema_parser = CSVParser.__new__(CSVParser)
-        temp_schema_parser.data = working_data
-        if working_data:
-            temp_schema_parser._infer_schema_all_rows()
-            temp_parser.schema = temp_schema_parser.schema
-        else:
-            temp_parser.schema = working_schema
-
-        # Check if sort column exists in the current data
-        if working_data and state['sort_column'] in working_data[0]:
-            working_data = temp_parser.sort_data(
-                state['sort_column'],
-                reverse=(state.get('sort_order', 'desc') == 'desc')
-            )
-
     # Apply limit if enabled
     total_rows = len(working_data)
     if state.get('use_limit', True) and state.get('limit'):
@@ -364,7 +329,6 @@ def load_dataset():
     thread.join()  # Wait for loading to complete
     
     return jsonify({'status': 'complete', 'dataset': dataset_name})
-
 
 PAGE_TEMPLATE = r"""
 <!doctype html>
@@ -762,7 +726,7 @@ PAGE_TEMPLATE = r"""
       <div class="card">
         <h2 class="card-title">Query Builder</h2>
 
-        {% if query_state.filters or query_state.sort_column or (not query_state.show_all_columns and query_state.selected_columns) or query_state.join_dataset or query_state.aggregation_column %}
+        {% if query_state.filters or (not query_state.show_all_columns and query_state.selected_columns) or query_state.join_dataset or query_state.aggregation_column %}
         <div class="query-summary">
           <div class="query-summary-title">Active Query Settings</div>
           {% if query_state.filters %}
@@ -770,9 +734,6 @@ PAGE_TEMPLATE = r"""
           {% endif %}
           {% if not query_state.show_all_columns and query_state.selected_columns %}
           <div>Columns: {{ query_state.selected_columns|length }} selected</div>
-          {% endif %}
-          {% if query_state.sort_column %}
-          <div>Sort: {{ query_state.sort_column }} ({{ 'DESC' if query_state.sort_order == 'desc' else 'ASC' }})</div>
           {% endif %}
           {% if query_state.join_dataset %}
           <div>Join: {{ query_state.join_dataset }}</div>
@@ -791,7 +752,6 @@ PAGE_TEMPLATE = r"""
         <div class="tabs">
           <button class="tab-btn active" onclick="switchTab('filter')">Filter</button>
           <button class="tab-btn" onclick="switchTab('columns')">Columns</button>
-          <button class="tab-btn" onclick="switchTab('sort')">Sort</button>
           <button class="tab-btn" onclick="switchTab('aggregate')">Aggregate</button>
           <button class="tab-btn" onclick="switchTab('join')">Join</button>
           <button class="tab-btn" onclick="switchTab('limit')">Limit</button>
@@ -878,33 +838,6 @@ PAGE_TEMPLATE = r"""
             
             <div class="button-group">
               <button type="submit" class="btn btn-primary">Apply</button>
-            </div>
-          </form>
-        </div>
-
-        <div id="tab-sort" class="tab-content">
-          <form method="post" action="/?action=update_sort">
-            <div class="form-row">
-              <div class="form-group">
-                <label class="form-label">Sort By</label>
-                <select name="sort_column" class="form-select">
-                  <option value="">No Sorting</option>
-                  {% for col in columns %}
-                    <option value="{{ col }}" {% if query_state.sort_column == col %}selected{% endif %}>{{ col }}</option>
-                  {% endfor %}
-                </select>
-              </div>
-              <div class="form-group">
-                <label class="form-label">Order</label>
-                <select name="sort_order" class="form-select">
-                  <option value="desc" {% if query_state.sort_order == 'desc' %}selected{% endif %}>Descending</option>
-                  <option value="asc" {% if query_state.sort_order == 'asc' %}selected{% endif %}>Ascending</option>
-                </select>
-              </div>
-            </div>
-            <div class="button-group">
-              <button type="submit" class="btn btn-primary">Apply</button>
-              <button type="submit" formaction="/?action=clear_sort" class="btn btn-secondary">Clear</button>
             </div>
           </form>
         </div>
@@ -1220,8 +1153,6 @@ def index():
             session['query_state'] = {
                 'filters': [],
                 'selected_columns': [],
-                'sort_column': '',
-                'sort_order': 'desc',
                 'show_all_columns': True,
                 'join_dataset': '',
                 'join_left_col': '',
@@ -1244,8 +1175,6 @@ def index():
         empty_query_state = {
             'filters': [],
             'selected_columns': [],
-            'sort_column': '',
-            'sort_order': 'desc',
             'show_all_columns': True,
             'join_dataset': '',
             'join_left_col': '',
@@ -1325,17 +1254,6 @@ def index():
                 session.modified = True
                 success = "Column selection updated"
                 
-            elif action == "update_sort":
-                query_state['sort_column'] = request.form.get("sort_column", "")
-                query_state['sort_order'] = request.form.get("sort_order", "desc")
-                session.modified = True
-                success = "Sorting updated"
-                
-            elif action == "clear_sort":
-                query_state['sort_column'] = ""
-                session.modified = True
-                success = "Sorting cleared"
-                
             elif action == "update_aggregation":
                 query_state['aggregation_function'] = request.form.get("aggregation_function", "")
                 query_state['aggregation_column'] = request.form.get("aggregation_column", "")
@@ -1391,8 +1309,6 @@ def index():
                 session['query_state'] = {
                     'filters': [],
                     'selected_columns': [],
-                    'sort_column': '',
-                    'sort_order': 'desc',
                     'show_all_columns': True,
                     'join_dataset': '',
                     'join_left_col': '',
