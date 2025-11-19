@@ -1,582 +1,1309 @@
-from flask import Flask, request, render_template_string
-from csv_parser import CSVParser  # uses your own parser to load data
+"""
+Enhanced Flask Web Application for CSVParser
+Features:
+- Multiple dataset loading with live chunk progress
+- Multiple filters support  
+- Dataset join functionality
+- Performance optimizations with caching
+- Dynamic chunk size based on file size
+"""
 
-# -----------------------------
-# App + DataFrame-style setup
-# -----------------------------
+from flask import Flask, request, render_template_string, session, jsonify
+from csv_parser import CSVParser
+import time
+import os
+import glob
+import threading
+
 APP = Flask(__name__)
+APP.secret_key = 'csv-parser-secret-key-2024'
 
-CSV_PATH = "data/database_24_25.csv"
-
-# Load entire CSV into memory as our "DataFrame"
-parser = CSVParser(CSV_PATH)
-parser.parse(type_inference=True)  # fills parser.data and parser.schema
-
-DATA = parser.get_data()           # list[dict]
-SCHEMA = parser.get_schema()       # dict[col -> type string]
-COLUMNS = list(SCHEMA.keys())
+# Configuration
+DATA_FOLDER = "data"
+parsers = {}  # Cache multiple parsers {dataset_name: parser}
+chunk_stats = {}  # Loading stats {dataset_name: stats}
+loading_progress = {}  # Real-time loading progress {dataset_name: progress}
+active_dataset = None
 
 
-# -----------------------------
-# Helper: pretty display
-# -----------------------------
-def to_table_rows(list_of_dicts, cols=None):
-    """Return (columns, rows) for rendering. cols optional; if None, infer from first row."""
-    if not list_of_dicts:
-        return [], []
-
-    if cols is None:
-        # Use keys from first row
-        cols = list(list_of_dicts[0].keys())
-
-    rows = []
-    for row in list_of_dicts:
-        rows.append([row.get(c, "") for c in cols])
-    return cols, rows
+def get_chunk_size(file_size_mb):
+    """Dynamically determine chunk size based on file size"""
+    if file_size_mb < 1:
+        return None  # Load entire file
+    elif file_size_mb < 10:
+        return 1000
+    elif file_size_mb < 50:
+        return 500
+    elif file_size_mb < 100:
+        return 200
+    else:
+        return 100
 
 
-# -----------------------------
-# HTML template
-# -----------------------------
-PAGE = r"""
+def load_dataset_with_progress(filepath, dataset_name):
+    """Load dataset with real-time progress tracking"""
+    global parsers, chunk_stats, loading_progress
+    
+    start_time = time.time()
+    parser = CSVParser(filepath)
+    
+    file_size = os.path.getsize(filepath)
+    file_size_mb = file_size / (1024 * 1024)
+    chunk_size = get_chunk_size(file_size_mb)
+    
+    loading_progress[dataset_name] = {
+        'status': 'loading',
+        'chunks_processed': 0,
+        'total_rows': 0,
+        'percent': 0
+    }
+    
+    if chunk_size is None:
+        # Small file - load all at once
+        parser.parse(type_inference=True)
+        chunk_stats[dataset_name] = {
+            'strategy': 'full',
+            'chunks_processed': 1,
+            'total_rows': len(parser.data),
+            'load_time': time.time() - start_time,
+            'file_size_mb': file_size_mb,
+            'chunk_size': 'N/A'
+        }
+        loading_progress[dataset_name]['status'] = 'complete'
+    else:
+        # Large file - chunked loading
+        chunk_stats[dataset_name] = {
+            'strategy': 'chunked',
+            'chunks_processed': 0,
+            'total_rows': 0,
+            'file_size_mb': file_size_mb,
+            'chunk_size': chunk_size
+        }
+        
+        chunk_generator = parser.parse(type_inference=True, chunk_size=chunk_size)
+        for chunk in chunk_generator:
+            chunk_stats[dataset_name]['chunks_processed'] += 1
+            chunk_stats[dataset_name]['total_rows'] += len(chunk)
+            parser.data.extend(chunk)
+            
+            # Update progress
+            loading_progress[dataset_name]['chunks_processed'] = chunk_stats[dataset_name]['chunks_processed']
+            loading_progress[dataset_name]['total_rows'] = chunk_stats[dataset_name]['total_rows']
+            
+        # Infer schema after all chunks loaded
+        if parser.data:
+            parser._infer_schema_all_rows()
+        
+        chunk_stats[dataset_name]['load_time'] = time.time() - start_time
+        loading_progress[dataset_name]['status'] = 'complete'
+        loading_progress[dataset_name]['percent'] = 100
+    
+    parsers[dataset_name] = parser
+    print(f"[{dataset_name}] Loaded {chunk_stats[dataset_name]['total_rows']} rows in {chunk_stats[dataset_name]['load_time']:.2f}s")
+
+
+def get_available_datasets():
+    """Get list of CSV files in data folder"""
+    csv_files = glob.glob(os.path.join(DATA_FOLDER, "*.csv"))
+    return [os.path.basename(f) for f in csv_files]
+
+
+def get_query_state():
+    """Get current query state from session with proper defaults"""
+    if 'query_state' not in session:
+        session['query_state'] = {
+            'filters': [],
+            'selected_columns': [],
+            'sort_column': '',
+            'sort_order': 'desc',
+            'show_all_columns': True,
+            'join_dataset': '',
+            'join_left_col': '',
+            'join_right_col': ''
+        }
+    
+    # Ensure all keys exist (for backwards compatibility)
+    state = session['query_state']
+    defaults = {
+        'filters': [],
+        'selected_columns': [],
+        'sort_column': '',
+        'sort_order': 'desc',
+        'show_all_columns': True,
+        'join_dataset': '',
+        'join_left_col': '',
+        'join_right_col': ''
+    }
+    
+    for key, default_value in defaults.items():
+        if key not in state:
+            state[key] = default_value
+    
+    session['query_state'] = state
+    return state
+
+
+def apply_filters(data, filters, schema):
+    """Apply multiple filters to data"""
+    if not filters:
+        return data
+    
+    filtered_data = data
+    for f in filters:
+        if not f.get('column') or not f.get('value'):
+            continue
+            
+        col = f['column']
+        op = f['op']
+        val = f['value']
+        
+        # Type inference
+        try:
+            val = int(val)
+        except ValueError:
+            try:
+                val = float(val)
+            except ValueError:
+                pass
+        
+        # Build condition
+        if op == ">":
+            condition = lambda row, c=col, v=val: row.get(c) is not None and row.get(c) > v
+        elif op == ">=":
+            condition = lambda row, c=col, v=val: row.get(c) is not None and row.get(c) >= v
+        elif op == "<":
+            condition = lambda row, c=col, v=val: row.get(c) is not None and row.get(c) < v
+        elif op == "<=":
+            condition = lambda row, c=col, v=val: row.get(c) is not None and row.get(c) <= v
+        elif op == "==":
+            condition = lambda row, c=col, v=val: row.get(c) == v
+        elif op == "!=":
+            condition = lambda row, c=col, v=val: row.get(c) != v
+        else:
+            continue
+        
+        # Filter data
+        temp_parser = CSVParser.__new__(CSVParser)
+        temp_parser.data = filtered_data
+        temp_parser.schema = schema
+        filtered_data = temp_parser.filter_rows(condition)
+    
+    return filtered_data
+
+
+def execute_query(p, state):
+    """Execute the combined query with optimizations"""
+    working_data = p.data
+    columns = list(p.schema.keys())
+    
+    # Ensure state has all required keys
+    if not isinstance(state, dict):
+        state = {}
+    
+    # Step 1: Apply multiple filters
+    if state.get('filters'):
+        working_data = apply_filters(working_data, state['filters'], p.schema)
+    
+    # Step 2: Apply column selection if not "show all"
+    if not state.get('show_all_columns', True) and state.get('selected_columns'):
+        temp_parser = CSVParser.__new__(CSVParser)
+        temp_parser.data = working_data
+        temp_parser.schema = p.schema
+        working_data = temp_parser.filter_columns(state['selected_columns'])
+        columns = state['selected_columns']
+    
+    # Step 3: Apply sorting if exists
+    if state.get('sort_column'):
+        temp_parser = CSVParser.__new__(CSVParser)
+        temp_parser.data = working_data
+        temp_parser.schema = {k: v for k, v in p.schema.items() if k in columns}
+        working_data = temp_parser.sort_data(state['sort_column'], reverse=(state.get('sort_order', 'desc') == 'desc'))
+    
+    return working_data, columns
+
+
+@APP.route("/api/loading_progress/<dataset_name>")
+def get_loading_progress(dataset_name):
+    """API endpoint for real-time loading progress"""
+    if dataset_name in loading_progress:
+        return jsonify(loading_progress[dataset_name])
+    return jsonify({'status': 'not_found'})
+
+
+@APP.route("/api/load_dataset", methods=["POST"])
+def load_dataset():
+    """API endpoint to load a dataset"""
+    data = request.get_json()
+    dataset_name = data.get('dataset')
+    
+    if not dataset_name:
+        return jsonify({'error': 'No dataset specified'}), 400
+    
+    filepath = os.path.join(DATA_FOLDER, dataset_name)
+    if not os.path.exists(filepath):
+        return jsonify({'error': 'Dataset not found'}), 404
+    
+    # Load in background thread
+    thread = threading.Thread(target=load_dataset_with_progress, args=(filepath, dataset_name))
+    thread.start()
+    
+    return jsonify({'status': 'loading_started', 'dataset': dataset_name})
+
+
+# Main HTML Template
+PAGE_TEMPLATE = r"""
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Data2App · Custom DataFrame Frontend</title>
+  <title>Basketball Stats Query Tool</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
     :root {
-      --bg: #020617;
-      --card: #0b1220;
-      --accent: #38bdf8;
-      --accent-soft: rgba(56,189,248,0.15);
-      --text: #e5e7eb;
-      --muted: #9ca3af;
-      --radius: 14px;
+      --primary: #2563eb;
+      --primary-soft: rgba(37,99,235,0.1);
+      --success: #16a34a;
+      --danger: #dc2626;
+      --bg: #f8fafc;
+      --card: #ffffff;
+      --text: #1e293b;
+      --text-muted: #64748b;
+      --border: #e2e8f0;
     }
+
     * {
       box-sizing: border-box;
-      font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     }
+
     body {
       margin: 0;
-      padding: 24px 16px 40px;
-      background: radial-gradient(circle at top, #1f2937 0, #020617 55%, #000 100%);
+      padding: 0;
+      background: var(--bg);
       color: var(--text);
     }
-    .shell {
-      max-width: 1200px;
+
+    .container {
+      max-width: 1400px;
       margin: 0 auto;
+      padding: 24px;
     }
+
     .header {
-      display: flex;
-      justify-content: space-between;
-      align-items: baseline;
-      gap: 12px;
-      margin-bottom: 20px;
+      background: white;
+      border-bottom: 1px solid var(--border);
+      padding: 20px 24px;
+      margin-bottom: 24px;
     }
-    h1 {
-      margin: 0;
-      font-size: 26px;
-      letter-spacing: 0.03em;
-    }
-    .subtitle {
-      margin-top: 4px;
-      color: var(--muted);
-      font-size: 13px;
-    }
-    .tag {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 4px 10px;
-      border-radius: 999px;
-      border: 1px solid rgba(148,163,184,0.4);
-      background: rgba(15,23,42,0.8);
-      font-size: 11px;
-      color: var(--muted);
-    }
-    .grid {
-      display: grid;
-      grid-template-columns: minmax(0, 1.8fr) minmax(0, 1.4fr);
-      gap: 18px;
-    }
-    @media (max-width: 900px) {
-      .grid {
-        grid-template-columns: minmax(0, 1fr);
-      }
-    }
-    .card {
-      background: linear-gradient(145deg, rgba(15,23,42,0.98), rgba(15,23,42,0.93));
-      border-radius: var(--radius);
-      border: 1px solid rgba(148,163,184,0.2);
-      box-shadow:
-        0 18px 45px rgba(15,23,42,0.75),
-        0 0 0 1px rgba(15,23,42,0.9);
-      padding: 14px 16px 14px;
-    }
-    .card h2 {
-      font-size: 15px;
-      margin: 0 0 4px;
-    }
-    .card p {
-      font-size: 12px;
-      margin: 0 0 8px;
-      color: var(--muted);
-    }
-    label {
-      display: block;
-      font-size: 12px;
-      margin-top: 6px;
-    }
-    input[type="text"],
-    input[type="number"],
-    select {
-      width: 100%;
-      margin-top: 2px;
-      padding: 5px 7px;
-      border-radius: 8px;
-      border: 1px solid rgba(148,163,184,0.45);
-      background: rgba(15,23,42,0.9);
+
+    .header h1 {
+      margin: 0 0 8px 0;
+      font-size: 28px;
       color: var(--text);
-      font-size: 12px;
     }
-    input:focus,
-    select:focus {
-      outline: 1px solid var(--accent);
+
+    .dataset-selector {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      margin-top: 16px;
     }
-    .btn {
-      margin-top: 8px;
-      padding: 6px 14px;
-      border-radius: 999px;
-      border: none;
-      cursor: pointer;
-      font-size: 12px;
-      font-weight: 500;
-      background: linear-gradient(135deg, #38bdf8, #0ea5e9);
-      color: #020617;
-    }
-    .btn:hover {
-      filter: brightness(1.06);
-    }
-    .small {
-      font-size: 11px;
-      color: var(--muted);
-    }
-    .summary-grid {
-      display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 8px;
-      margin: 8px 0 10px;
-    }
-    .summary-item {
-      background: radial-gradient(circle at top left, rgba(56,189,248,0.16), rgba(15,23,42,0.9));
-      border-radius: 10px;
-      border: 1px solid rgba(148,163,184,0.25);
-      padding: 6px 8px;
-      font-size: 12px;
-    }
-    .summary-label {
-      color: var(--muted);
-      font-size: 11px;
-      margin-bottom: 1px;
-    }
-    .summary-value {
+
+    .form-select {
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
       font-size: 14px;
+      min-width: 200px;
+    }
+
+    .btn {
+      padding: 10px 20px;
+      border: none;
+      border-radius: 6px;
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .btn-primary {
+      background: var(--primary);
+      color: white;
+    }
+
+    .btn-primary:hover {
+      background: #1d4ed8;
+    }
+
+    .btn-secondary {
+      background: #f1f5f9;
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+
+    .btn-success {
+      background: var(--success);
+      color: white;
+    }
+
+    .btn-danger {
+      background: #fee2e2;
+      color: var(--danger);
+      border: 1px solid #fecaca;
+    }
+
+    .loading-card {
+      background: white;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+      margin-top: 12px;
+    }
+
+    .progress-bar {
+      width: 100%;
+      height: 24px;
+      background: #f1f5f9;
+      border-radius: 12px;
+      overflow: hidden;
+      position: relative;
+    }
+
+    .progress-fill {
+      height: 100%;
+      background: linear-gradient(90deg, var(--success), #22c55e);
+      transition: width 0.3s;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: white;
+      font-size: 12px;
       font-weight: 600;
     }
-    table {
+
+    .stats-bar {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-top: 12px;
+    }
+
+    .stat-badge {
+      padding: 6px 12px;
+      background: var(--primary-soft);
+      color: var(--primary);
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: 500;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 2fr 1fr;
+      gap: 24px;
+    }
+
+    @media (max-width: 1024px) {
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .card {
+      background: white;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      padding: 20px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    }
+
+    .card-title {
+      font-size: 18px;
+      font-weight: 600;
+      margin: 0 0 16px 0;
+      color: var(--text);
+    }
+
+    .tabs {
+      display: flex;
+      gap: 8px;
+      border-bottom: 2px solid var(--border);
+      margin-bottom: 20px;
+    }
+
+    .tab-btn {
+      padding: 12px 20px;
+      border: none;
+      background: transparent;
+      color: var(--text-muted);
+      cursor: pointer;
+      font-size: 14px;
+      font-weight: 500;
+      border-bottom: 2px solid transparent;
+      margin-bottom: -2px;
+    }
+
+    .tab-btn.active {
+      color: var(--primary);
+      border-bottom-color: var(--primary);
+    }
+
+    .tab-content {
+      display: none;
+    }
+
+    .tab-content.active {
+      display: block;
+    }
+
+    .form-group {
+      margin-bottom: 16px;
+    }
+
+    .form-label {
+      display: block;
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text);
+      margin-bottom: 6px;
+    }
+
+    .form-input {
+      width: 100%;
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      font-size: 14px;
+      color: var(--text);
+    }
+
+    .form-input:focus, .form-select:focus {
+      outline: none;
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px var(--primary-soft);
+    }
+
+    .form-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+
+    .form-row-3 {
+      display: grid;
+      grid-template-columns: 2fr 1fr 2fr;
+      gap: 12px;
+    }
+
+    .filter-list {
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px;
+      background: #f8fafc;
+      margin-bottom: 12px;
+    }
+
+    .filter-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 8px 12px;
+      background: white;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      margin-bottom: 8px;
+    }
+
+    .filter-item:last-child {
+      margin-bottom: 0;
+    }
+
+    .remove-filter-btn {
+      background: #fee2e2;
+      color: var(--danger);
+      border: none;
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+
+    .checkbox-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 8px;
+      max-height: 200px;
+      overflow-y: auto;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px;
+      background: #f8fafc;
+    }
+
+    .checkbox-label {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+
+    .button-group {
+      display: flex;
+      gap: 12px;
+      margin-top: 20px;
+      flex-wrap: wrap;
+    }
+
+    .alert {
+      padding: 12px 16px;
+      border-radius: 6px;
+      margin-top: 16px;
+      font-size: 14px;
+    }
+
+    .alert-error {
+      background: #fee2e2;
+      color: #991b1b;
+      border: 1px solid #fecaca;
+    }
+
+    .alert-success {
+      background: #dcfce7;
+      color: #166534;
+      border: 1px solid #bbf7d0;
+    }
+
+    .results-card {
+      margin-top: 20px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+      background: white;
+    }
+
+    .results-header {
+      padding: 12px 16px;
+      background: #f8fafc;
+      border-bottom: 1px solid var(--border);
+      font-size: 13px;
+      color: var(--text-muted);
+    }
+
+    .results-table-wrapper {
+      max-height: 500px;
+      overflow: auto;
+    }
+
+    .results-table {
       width: 100%;
       border-collapse: collapse;
-      font-size: 11px;
+      font-size: 13px;
     }
-    th, td {
-      padding: 4px 6px;
+
+    .results-table th,
+    .results-table td {
+      padding: 10px 12px;
       text-align: left;
+      border-bottom: 1px solid var(--border);
     }
-    thead {
-      background: rgba(15,23,42,0.95);
+
+    .results-table th {
+      background: #f8fafc;
+      font-weight: 600;
+      color: var(--text);
       position: sticky;
       top: 0;
       z-index: 1;
     }
-    th {
-      border-bottom: 1px solid rgba(148,163,184,0.6);
-      color: var(--muted);
-      font-weight: 500;
+
+    .results-table tbody tr:hover {
+      background: #f8fafc;
     }
-    tbody tr:nth-child(odd) {
-      background: rgba(15,23,42,0.9);
-    }
-    tbody tr:nth-child(even) {
-      background: rgba(15,23,42,0.7);
-    }
-    .results-card {
-      margin-top: 14px;
-      border-radius: var(--radius);
-      border: 1px solid rgba(148,163,184,0.4);
-      background: rgba(15,23,42,0.9);
-      padding: 10px 12px 12px;
-      max-height: 430px;
-      overflow: auto;
-    }
-    .results-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: baseline;
-      gap: 8px;
-      margin-bottom: 6px;
-      font-size: 12px;
-      color: var(--muted);
-    }
-    .error {
-      margin-top: 6px;
-      padding: 6px 8px;
+
+    .current-query-box {
+      background: #eff6ff;
+      border: 1px solid #bfdbfe;
       border-radius: 8px;
-      border: 1px solid rgba(248,113,113,0.6);
-      background: rgba(248,113,113,0.12);
-      color: #fecaca;
-      font-size: 12px;
+      padding: 12px;
+      margin-bottom: 16px;
     }
-    code {
-      font-size: 11px;
-      background: rgba(15,23,42,0.9);
-      padding: 2px 4px;
-      border-radius: 4px;
+
+    .current-query-title {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--primary);
+      margin-bottom: 8px;
+    }
+
+    .current-query-item {
+      font-size: 13px;
+      color: var(--text);
+      margin-bottom: 4px;
+    }
+
+    .show-all-toggle {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 12px;
+      background: #f8fafc;
+      border-radius: 6px;
+      margin-bottom: 12px;
+    }
+
+    .info-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
+      margin-bottom: 20px;
+    }
+
+    .info-item {
+      padding: 16px;
+      background: #f8fafc;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+    }
+
+    .info-label {
+      font-size: 12px;
+      color: var(--text-muted);
+      margin-bottom: 4px;
+    }
+
+    .info-value {
+      font-size: 20px;
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    .schema-table {
+      width: 100%;
+      font-size: 13px;
+      border-collapse: collapse;
+    }
+
+    .schema-table th,
+    .schema-table td {
+      padding: 8px 12px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .schema-table th {
+      background: #f8fafc;
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    .join-section {
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px;
+      background: #f8fafc;
+      margin-bottom: 12px;
     }
   </style>
 </head>
 <body>
-  <div class="shell">
-    <div class="header">
-      <div>
-        <h1>Data2App · Custom DataFrame</h1>
-        <div class="subtitle">
-          7 SQL-style operations implemented using our own CSV parser & in-memory dataframe.
+  <div class="header">
+    <h1>🏀 Basketball Stats Query Tool</h1>
+    
+    <div class="dataset-selector">
+      <label style="font-size: 14px; font-weight: 500;">Select Dataset:</label>
+      <select id="datasetSelect" class="form-select">
+        <option value="">-- Choose Dataset --</option>
+        {% for ds in available_datasets %}
+          <option value="{{ ds }}" {% if ds == current_dataset %}selected{% endif %}>{{ ds }}</option>
+        {% endfor %}
+      </select>
+      <button onclick="loadSelectedDataset()" class="btn btn-primary">📂 Load Dataset</button>
+    </div>
+
+    <div id="loadingSection" style="display: none;">
+      <div class="loading-card">
+        <div style="font-size: 14px; font-weight: 600; margin-bottom: 8px;">Loading: <span id="loadingDatasetName"></span></div>
+        <div class="progress-bar">
+          <div id="progressFill" class="progress-fill" style="width: 0%">0%</div>
+        </div>
+        <div style="margin-top: 8px; font-size: 13px; color: var(--text-muted);">
+          <span id="loadingStats">Initializing...</span>
         </div>
       </div>
-      <div class="tag">
-        <span>●</span>
-        <span>CSVParser · No pandas/csv/json</span>
-      </div>
     </div>
 
+    {% if current_dataset and current_dataset in chunk_stats %}
+    <div class="stats-bar">
+      <span class="stat-badge">{{ chunk_stats[current_dataset].get('strategy', 'N/A').upper() }} Loading</span>
+      <span class="stat-badge">{{ chunk_stats[current_dataset].get('total_rows', 0) }} Total Rows</span>
+      <span class="stat-badge">{{ "%.2f"|format(chunk_stats[current_dataset].get('load_time', 0)) }}s Load Time</span>
+      <span class="stat-badge">{{ "%.2f"|format(chunk_stats[current_dataset].get('file_size_mb', 0)) }}MB File Size</span>
+      {% if chunk_stats[current_dataset].get('chunk_size') != 'N/A' %}
+      <span class="stat-badge">Chunk Size: {{ chunk_stats[current_dataset].get('chunk_size', 0) }} rows</span>
+      {% endif %}
+    </div>
+    {% endif %}
+  </div>
+
+  <div class="container">
+    {% if not current_dataset %}
+    <div class="card">
+      <h2 style="text-align: center; color: var(--text-muted);">👆 Please select and load a dataset to begin</h2>
+    </div>
+    {% else %}
     <div class="grid">
-      <!-- LEFT: controls / functions -->
-      <div>
-        <!-- Dataset summary -->
-        <section class="card">
-          <h2>Dataset summary</h2>
-          <p>Loaded once with <code>CSVParser.parse()</code> into main memory.</p>
-          <div class="summary-grid">
-            <div class="summary-item">
-              <div class="summary-label">Rows</div>
-              <div class="summary-value">{{ row_count }}</div>
-            </div>
-            <div class="summary-item">
-              <div class="summary-label">Columns</div>
-              <div class="summary-value">{{ col_count }}</div>
-            </div>
-            <div class="summary-item">
-              <div class="summary-label">File</div>
-              <div class="summary-value" style="font-size: 11px;">{{ csv_path }}</div>
-            </div>
-          </div>
-          <div class="small">
-            Example __getitem__ usage: <code>parser["PTS"]</code> returns the list of all PTS values.
-          </div>
-        </section>
+      <!-- LEFT: Query Builder -->
+      <div class="card">
+        <h2 class="card-title">Build Your Query</h2>
 
-        <!-- 1) Filtering -->
-        <section class="card" style="margin-top: 12px;">
-          <h2>1) Filter: team &amp; minimum points</h2>
-          <p>SQL analog: <code>SELECT Player, Tm, PTS FROM stats WHERE Tm = ? AND PTS &gt;= ?</code></p>
-          <form method="post">
-            <input type="hidden" name="action" value="filter_team_pts">
-            <label>
-              Team code (Tm):
-              <input type="text" name="team" placeholder="e.g. LAL, GSW">
-            </label>
-            <label>
-              Minimum points (PTS ≥):
-              <input type="number" name="min_pts" value="20">
-            </label>
-            <button class="btn" type="submit">Run filter</button>
-          </form>
-        </section>
-
-        <!-- 2) Projection -->
-        <section class="card" style="margin-top: 12px;">
-          <h2>2) Projection: select columns</h2>
-          <p>SQL analog: <code>SELECT col1, col2, ... FROM stats</code></p>
-          <form method="post">
-            <input type="hidden" name="action" value="project_columns">
-            <label>
-              Columns (comma-separated):
-              <input type="text" name="cols" placeholder="e.g. Player,Tm,PTS">
-            </label>
-            <div class="small">
-              Available columns: {{ available_cols }}
-            </div>
-            <button class="btn" type="submit">Project</button>
-          </form>
-        </section>
-
-        <!-- 3) Top N scorers -->
-        <section class="card" style="margin-top: 12px;">
-          <h2>3) Top N scorers</h2>
-          <p>SQL analog: <code>SELECT Player, Tm, PTS FROM stats ORDER BY PTS DESC LIMIT N</code></p>
-          <form method="post">
-            <input type="hidden" name="action" value="top_scorers">
-            <label>
-              N (number of rows):
-              <input type="number" name="n" value="10">
-            </label>
-            <button class="btn" type="submit">Show top scorers</button>
-          </form>
-        </section>
-
-        <!-- 4) Group by team: AVG(PTS) -->
-        <section class="card" style="margin-top: 12px;">
-          <h2>4) Group by team – AVG(PTS)</h2>
-          <p>SQL analog: <code>SELECT Tm, AVG(PTS) FROM stats GROUP BY Tm</code></p>
-          <form method="post">
-            <input type="hidden" name="action" value="avg_pts_by_team">
-            <button class="btn" type="submit">Compute team averages</button>
-          </form>
-        </section>
-
-        <!-- 5) Group by opponent: COUNT + AVG(PTS) -->
-        <section class="card" style="margin-top: 12px;">
-          <h2>5) Group by Opp – COUNT &amp; AVG(PTS)</h2>
-          <p>SQL analog: <code>SELECT Opp, COUNT(*), AVG(PTS) FROM stats GROUP BY Opp</code></p>
-          <form method="post">
-            <input type="hidden" name="action" value="opp_stats">
-            <button class="btn" type="submit">Compute opponent stats</button>
-          </form>
-        </section>
-
-        <!-- 6) Global aggregations -->
-        <section class="card" style="margin-top: 12px;">
-          <h2>6) Global aggregations</h2>
-          <p>SQL analog: <code>SELECT COUNT(*), SUM(PTS), AVG(PTS) FROM stats</code></p>
-          <form method="post">
-            <input type="hidden" name="action" value="global_aggs">
-            <button class="btn" type="submit">Compute global stats</button>
-          </form>
-        </section>
-
-        <!-- 7) Join -->
-        <section class="card" style="margin-top: 12px; margin-bottom: 12px;">
-          <h2>7) Join with teams metadata</h2>
-          <p>SQL analog: <code>SELECT p.Player, p.Tm, t.Region FROM stats p JOIN teams t ON p.Tm = t.Tm</code></p>
-          <form method="post">
-            <input type="hidden" name="action" value="join_teams">
-            <button class="btn" type="submit">Run join</button>
-          </form>
-          <div class="small">
-            Uses <code>parser.join(other_data, left_on="Tm", right_on="Tm")</code>.
-          </div>
-        </section>
-      </div>
-
-      <!-- RIGHT: result viewer -->
-      <div>
-        <section class="card">
-          <h2>Result viewer</h2>
-          <p>Shows the output of the last operation you ran.</p>
-          {% if error %}
-            <div class="error">{{ error }}</div>
+        <!-- Current Query Summary -->
+        {% if query_state.filters or query_state.sort_column or (not query_state.show_all_columns and query_state.selected_columns) or query_state.join_dataset %}
+        <div class="current-query-box">
+          <div class="current-query-title">🔍 Active Query Settings:</div>
+          {% if query_state.filters %}
+          <div class="current-query-item">• {{ query_state.filters|length }} filter(s) applied</div>
           {% endif %}
-          {% if result_title %}
-            <div class="results-card">
-              <div class="results-header">
-                <div>{{ result_title }}</div>
-                <div>{{ row_count_result }} row(s)</div>
+          {% if not query_state.show_all_columns and query_state.selected_columns %}
+          <div class="current-query-item">• Showing {{ query_state.selected_columns|length }} column(s)</div>
+          {% endif %}
+          {% if query_state.sort_column %}
+          <div class="current-query-item">• Sorted by: {{ query_state.sort_column }} ({{ 'Highest to Lowest' if query_state.sort_order == 'desc' else 'Lowest to Highest' }})</div>
+          {% endif %}
+          {% if query_state.join_dataset %}
+          <div class="current-query-item">• Joined with: {{ query_state.join_dataset }}</div>
+          {% endif %}
+        </div>
+        {% endif %}
+
+        <div class="tabs">
+          <button class="tab-btn active" onclick="switchTab('filter')">📊 Filter Data</button>
+          <button class="tab-btn" onclick="switchTab('columns')">📋 Select Columns</button>
+          <button class="tab-btn" onclick="switchTab('sort')">⬆️ Sort Results</button>
+          <button class="tab-btn" onclick="switchTab('join')">🔗 Join Data</button>
+        </div>
+
+        <!-- Filter Tab -->
+        <div id="tab-filter" class="tab-content active">
+          <h3 style="font-size: 15px; margin-bottom: 12px;">Active Filters</h3>
+          
+          {% if query_state.filters %}
+          <div class="filter-list">
+            {% for filter in query_state.filters %}
+            <div class="filter-item">
+              <span>{{ filter.column }} {{ filter.op }} {{ filter.value }}</span>
+              <form method="post" action="/?action=remove_filter" style="display: inline;">
+                <input type="hidden" name="filter_index" value="{{ loop.index0 }}">
+                <button type="submit" class="remove-filter-btn">✕ Remove</button>
+              </form>
+            </div>
+            {% endfor %}
+          </div>
+          {% else %}
+          <div style="padding: 12px; background: #f8fafc; border-radius: 6px; margin-bottom: 12px; text-align: center; color: var(--text-muted);">
+            No filters applied
+          </div>
+          {% endif %}
+
+          <h3 style="font-size: 15px; margin: 16px 0 12px;">Add New Filter</h3>
+          <form method="post" action="/?action=add_filter">
+            <div class="form-row-3">
+              <div class="form-group">
+                <label class="form-label">Column</label>
+                <select name="filter_column" class="form-select">
+                  {% for col in columns %}
+                    <option value="{{ col }}">{{ col }}</option>
+                  {% endfor %}
+                </select>
               </div>
-              {% if columns and rows %}
-                <table>
-                  <thead>
-                    <tr>
-                      {% for c in columns %}
-                        <th>{{ c }}</th>
-                      {% endfor %}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {% for r in rows %}
-                      <tr>
-                        {% for cell in r %}
-                          <td>{{ cell }}</td>
-                        {% endfor %}
-                      </tr>
-                    {% endfor %}
-                  </tbody>
-                </table>
-              {% else %}
-                <div class="small">No rows to display.</div>
+              <div class="form-group">
+                <label class="form-label">Condition</label>
+                <select name="filter_op" class="form-select">
+                  <option value=">">></option>
+                  <option value=">=">≥</option>
+                  <option value="<"><</option>
+                  <option value="<=">≤</option>
+                  <option value="==">==</option>
+                  <option value="!=">≠</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label">Value</label>
+                <input type="text" name="filter_value" class="form-input" placeholder="e.g., 30">
+              </div>
+            </div>
+            <div class="button-group">
+              <button type="submit" class="btn btn-success">➕ Add Filter</button>
+              {% if query_state.filters %}
+              <button type="submit" formaction="/?action=clear_filters" class="btn btn-danger">🗑️ Clear All Filters</button>
               {% endif %}
             </div>
-          {% else %}
-            <div class="small">
-              Run any function on the left to see results here.
+          </form>
+        </div>
+
+        <!-- Columns Tab -->
+        <div id="tab-columns" class="tab-content">
+          <form method="post" action="/?action=update_columns">
+            <div class="show-all-toggle">
+              <input type="checkbox" name="show_all_columns" id="show_all_columns" 
+                     {% if query_state.show_all_columns %}checked{% endif %} onchange="toggleColumnSelection()">
+              <label for="show_all_columns" style="cursor: pointer;">Show All Columns</label>
             </div>
+            
+            <div id="columnSelection" {% if query_state.show_all_columns %}style="display:none"{% endif %}>
+              <div class="form-group">
+                <label class="form-label">Select Which Columns to Show</label>
+                <div class="checkbox-grid">
+                  {% for col in columns %}
+                    <label class="checkbox-label">
+                      <input type="checkbox" name="selected_columns" value="{{ col }}" 
+                             {% if col in query_state.selected_columns %}checked{% endif %}>
+                      {{ col }}
+                    </label>
+                  {% endfor %}
+                </div>
+              </div>
+            </div>
+            
+            <div class="button-group">
+              <button type="submit" class="btn btn-primary">✓ Apply Column Selection</button>
+            </div>
+          </form>
+        </div>
+
+        <!-- Sort Tab -->
+        <div id="tab-sort" class="tab-content">
+          <form method="post" action="/?action=update_sort">
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label">Sort By Column</label>
+                <select name="sort_column" class="form-select">
+                  <option value="">-- No Sorting --</option>
+                  {% for col in columns %}
+                    <option value="{{ col }}" {% if query_state.sort_column == col %}selected{% endif %}>{{ col }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label">Sort Order</label>
+                <select name="sort_order" class="form-select">
+                  <option value="desc" {% if query_state.sort_order == 'desc' %}selected{% endif %}>Highest to Lowest</option>
+                  <option value="asc" {% if query_state.sort_order == 'asc' %}selected{% endif %}>Lowest to Highest</option>
+                </select>
+              </div>
+            </div>
+            <div class="button-group">
+              <button type="submit" class="btn btn-primary">✓ Apply Sorting</button>
+              <button type="submit" formaction="/?action=clear_sort" class="btn btn-secondary">✕ Remove Sorting</button>
+            </div>
+          </form>
+        </div>
+
+        <!-- Join Tab -->
+        <div id="tab-join" class="tab-content">
+          <form method="post" action="/?action=join_dataset">
+            <div class="form-group">
+              <label class="form-label">Dataset to Join</label>
+              <select name="join_dataset" class="form-select">
+                <option value="">-- Select Dataset --</option>
+                {% for ds in available_datasets %}
+                  {% if ds != current_dataset %}
+                    <option value="{{ ds }}" {% if query_state.join_dataset == ds %}selected{% endif %}>{{ ds }}</option>
+                  {% endif %}
+                {% endfor %}
+              </select>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label">Join On (Current Dataset)</label>
+                <select name="join_left_col" class="form-select">
+                  {% for col in columns %}
+                    <option value="{{ col }}" {% if query_state.join_left_col == col %}selected{% endif %}>{{ col }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label">Join On (Other Dataset)</label>
+                <select name="join_right_col" class="form-select">
+                  <option value="">-- Select Column --</option>
+                </select>
+              </div>
+            </div>
+            <div class="button-group">
+              <button type="submit" class="btn btn-success">🔗 Apply Join</button>
+              {% if query_state.join_dataset %}
+              <button type="submit" formaction="/?action=clear_join" class="btn btn-secondary">✕ Remove Join</button>
+              {% endif %}
+            </div>
+          </form>
+        </div>
+
+        <div class="button-group" style="margin-top: 24px; padding-top: 24px; border-top: 1px solid var(--border);">
+          <form method="post" action="/?action=execute_query" style="display: inline;">
+            <button type="submit" class="btn btn-primary">▶ Run Query</button>
+          </form>
+          <form method="post" action="/?action=clear_all" style="display: inline;">
+            <button type="submit" class="btn btn-danger">🗑️ Clear All Settings</button>
+          </form>
+        </div>
+
+        {% if error %}
+          <div class="alert alert-error">{{ error }}</div>
+        {% endif %}
+
+        {% if success %}
+          <div class="alert alert-success">{{ success }}</div>
+        {% endif %}
+
+        {% if results %}
+          <div class="results-card">
+            <div class="results-header">
+              Showing {{ results|length }} result(s) with {{ result_columns|length }} column(s)
+            </div>
+            <div class="results-table-wrapper">
+              <table class="results-table">
+                <thead>
+                  <tr>
+                    {% for col in result_columns %}
+                      <th>{{ col }}</th>
+                    {% endfor %}
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for row in results %}
+                    <tr>
+                      {% for col in result_columns %}
+                        <td>
+                          {% if row[col] is number %}
+                            {{ "%.2f"|format(row[col]) if row[col] is float else row[col] }}
+                          {% else %}
+                            {{ row[col] }}
+                          {% endif %}
+                        </td>
+                      {% endfor %}
+                    </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        {% endif %}
+      </div>
+
+      <!-- RIGHT: Dataset Info -->
+      <div class="card">
+        <h2 class="card-title">Dataset Information</h2>
+        
+        <div class="info-grid">
+          <div class="info-item">
+            <div class="info-label">Total Rows</div>
+            <div class="info-value">{{ row_count }}</div>
+          </div>
+          <div class="info-item">
+            <div class="info-label">Columns</div>
+            <div class="info-value">{{ schema|length }}</div>
+          </div>
+          <div class="info-item">
+            <div class="info-label">Data Types</div>
+            <div class="info-value">{{ unique_types }}</div>
+          </div>
+        </div>
+
+        <h3 style="font-size: 16px; margin-bottom: 12px;">Column Details</h3>
+        <div style="max-height: 400px; overflow-y: auto;">
+          <table class="schema-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Column Name</th>
+                <th>Data Type</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for col_name, col_type in schema.items() %}
+                <tr>
+                  <td>{{ loop.index }}</td>
+                  <td>{{ col_name }}</td>
+                  <td>{{ col_type }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+
+        <h3 style="font-size: 16px; margin: 20px 0 12px;">Loading Performance</h3>
+        <div style="font-size: 13px; line-height: 1.8; color: var(--text-muted);">
+          <div><strong>Strategy:</strong> {{ chunk_stats[current_dataset].get('strategy', 'N/A').upper() }}</div>
+          <div><strong>Chunks Processed:</strong> {{ chunk_stats[current_dataset].get('chunks_processed', 0) }}</div>
+          <div><strong>Load Time:</strong> {{ "%.2f"|format(chunk_stats[current_dataset].get('load_time', 0)) }}s</div>
+          <div><strong>File Size:</strong> {{ "%.2f"|format(chunk_stats[current_dataset].get('file_size_mb', 0)) }}MB</div>
+          {% if chunk_stats[current_dataset].get('chunk_size') != 'N/A' %}
+          <div><strong>Chunk Size:</strong> {{ chunk_stats[current_dataset].get('chunk_size', 0) }} rows/chunk</div>
+          <div style="margin-top: 8px; padding: 8px; background: #eff6ff; border-radius: 4px; font-size: 12px;">
+            💡 <strong>Scaling Strategy:</strong> Larger files use smaller chunks for memory efficiency
+          </div>
           {% endif %}
-        </section>
+        </div>
       </div>
     </div>
+    {% endif %}
   </div>
+
+  <script>
+    function switchTab(tabName) {
+      document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+      document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+      document.getElementById('tab-' + tabName).classList.add('active');
+      event.target.classList.add('active');
+    }
+
+    function toggleColumnSelection() {
+      const showAll = document.getElementById('show_all_columns').checked;
+      document.getElementById('columnSelection').style.display = showAll ? 'none' : 'block';
+    }
+
+    function loadSelectedDataset() {
+      const select = document.getElementById('datasetSelect');
+      const dataset = select.value;
+      
+      if (!dataset) {
+        alert('Please select a dataset');
+        return;
+      }
+
+      // Show loading section
+      document.getElementById('loadingSection').style.display = 'block';
+      document.getElementById('loadingDatasetName').textContent = dataset;
+
+      // Start loading
+      fetch('/api/load_dataset', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({dataset: dataset})
+      })
+      .then(response => response.json())
+      .then(data => {
+        if (data.error) {
+          alert('Error: ' + data.error);
+          return;
+        }
+
+        // Poll for progress
+        const interval = setInterval(() => {
+          fetch('/api/loading_progress/' + dataset)
+            .then(r => r.json())
+            .then(progress => {
+              if (progress.status === 'loading') {
+                const percent = progress.chunks_processed * 10; // Approximate
+                document.getElementById('progressFill').style.width = Math.min(percent, 99) + '%';
+                document.getElementById('progressFill').textContent = Math.min(percent, 99) + '%';
+                document.getElementById('loadingStats').textContent = 
+                  `Processed ${progress.chunks_processed} chunk(s), ${progress.total_rows} rows loaded...`;
+              } else if (progress.status === 'complete') {
+                clearInterval(interval);
+                document.getElementById('progressFill').style.width = '100%';
+                document.getElementById('progressFill').textContent = '100%';
+                document.getElementById('loadingStats').textContent = 'Complete! Reloading page...';
+                
+                // Redirect to show loaded dataset
+                setTimeout(() => {
+                  window.location.href = '/?dataset=' + dataset;
+                }, 1000);
+              }
+            });
+        }, 500);
+      });
+    }
+  </script>
 </body>
 </html>
 """
 
 
-# -----------------------------
-# Route
-# -----------------------------
 @APP.route("/", methods=["GET", "POST"])
 def index():
+    """Main route with multi-dataset support and multiple filters"""
+    global active_dataset
+    
+    # Get or set active dataset
+    if request.args.get('dataset'):
+        active_dataset = request.args.get('dataset')
+        session['active_dataset'] = active_dataset
+    elif 'active_dataset' in session:
+        active_dataset = session['active_dataset']
+    
+    # Get available datasets
+    available_datasets = get_available_datasets()
+    
+    # If no dataset loaded, show selection screen
+    if not active_dataset or active_dataset not in parsers:
+        empty_query_state = {
+            'filters': [],
+            'selected_columns': [],
+            'sort_column': '',
+            'sort_order': 'desc',
+            'show_all_columns': True,
+            'join_dataset': '',
+            'join_left_col': '',
+            'join_right_col': ''
+        }
+        return render_template_string(
+            PAGE_TEMPLATE,
+            available_datasets=available_datasets,
+            current_dataset=None,
+            chunk_stats={},
+            query_state=empty_query_state,
+            error=None,
+            success=None,
+            results=[],
+            result_columns=[],
+            columns=[],
+            schema={},
+            row_count=0,
+            unique_types=0
+        )
+    
+    p = parsers[active_dataset]
+    row_count = len(p.data)
+    schema = p.get_schema()
+    columns = list(schema.keys())
+    unique_types = len(set(schema.values()))
+    
     error = None
-    result_title = ""
-    columns = []
-    rows = []
-
+    success = None
+    results = []
+    result_columns = []
+    
+    query_state = get_query_state()
+    
     if request.method == "POST":
-        action = request.form.get("action", "")
-
+        action = request.args.get("action", "")
+        
         try:
-            if action == "filter_team_pts":
-                team = request.form.get("team", "").strip().upper()
-                min_pts_raw = request.form.get("min_pts", "0").strip()
-                try:
-                    min_pts = int(min_pts_raw)
-                except ValueError:
-                    min_pts = 0
-
-                def cond(row):
-                    # Use get with defaults in case column missing
-                    row_team = str(row.get("Tm", "")).upper()
-                    pts = row.get("PTS", 0)
-                    if pts is None:
-                        return False
-                    if team and row_team != team:
-                        return False
-                    return pts >= min_pts
-
-                filtered = parser.filter_rows(cond)
-                cols, rows_ = to_table_rows(filtered, cols=["Player", "Tm", "PTS"] if filtered else [])
-                result_title = f"Filter: team='{team or 'ANY'}', PTS >= {min_pts}"
-                columns, rows = cols, rows_
-
-            elif action == "project_columns":
-                cols_str = request.form.get("cols", "")
-                cols_req = [c.strip() for c in cols_str.split(",") if c.strip()]
-                if not cols_req:
-                    raise ValueError("Please enter at least one column.")
-                projected = parser.filter_columns(cols_req)
-                cols, rows_ = to_table_rows(projected, cols=cols_req)
-                result_title = f"Projection on columns: {', '.join(cols_req)}"
-                columns, rows = cols, rows_
-
-            elif action == "top_scorers":
-                n_raw = request.form.get("n", "10").strip()
-                try:
-                    n = int(n_raw)
-                except ValueError:
-                    n = 10
-                rows_with_pts = [r for r in DATA if r.get("PTS") is not None]
-                top = sorted(rows_with_pts, key=lambda r: r["PTS"], reverse=True)[:n]
-                cols, rows_ = to_table_rows(top, cols=["Player", "Tm", "PTS"])
-                result_title = f"Top {n} scorers by PTS"
-                columns, rows = cols, rows_
-
-            elif action == "avg_pts_by_team":
-                # uses CSVParser.aggregate with group_by
-                agg = parser.aggregate(group_by="Tm", target_col="PTS", func="avg")
-                # turn dict into list of dicts
-                rows_list = [{"Tm": k, "avg_PTS": round(v, 2) if v is not None else None}
-                             for k, v in sorted(agg.items(), key=lambda kv: (kv[1] is None, -(kv[1] or 0)))]
-                cols, rows_ = to_table_rows(rows_list, cols=["Tm", "avg_PTS"])
-                result_title = "Average PTS per team (GROUP BY Tm)"
-                columns, rows = cols, rows_
-
-            elif action == "opp_stats":
-                # We'll compute COUNT and AVG using aggregate twice or manual
-                # First: group by Opp for PTS
-                agg = parser.aggregate(group_by="Opp", target_col="PTS", func="avg")
-                # Count games per Opp
-                counts = parser.aggregate(group_by="Opp", target_col="PTS", func="count")
-                rows_list = []
-                for opp in agg.keys():
-                    rows_list.append({
-                        "Opp": opp,
-                        "games": counts.get(opp, 0),
-                        "avg_PTS": round(agg[opp], 2) if agg[opp] is not None else None
+            if action == "add_filter":
+                filter_col = request.form.get("filter_column")
+                filter_op = request.form.get("filter_op")
+                filter_val = request.form.get("filter_value")
+                
+                if filter_col and filter_val:
+                    query_state['filters'].append({
+                        'column': filter_col,
+                        'op': filter_op,
+                        'value': filter_val
                     })
-                rows_list.sort(key=lambda r: r["avg_PTS"] if r["avg_PTS"] is not None else -1, reverse=True)
-                cols, rows_ = to_table_rows(rows_list, cols=["Opp", "games", "avg_PTS"])
-                result_title = "Opponent stats: games & AVG(PTS) per Opp"
-                columns, rows = cols, rows_
-
-            elif action == "global_aggs":
-                # Demonstrate __getitem__ style and aggregate without group
-                pts_list = parser["PTS"]  # DataFrame-like access
-                # Use aggregate for consistency
-                total_pts = parser.aggregate(group_by=None, target_col="PTS", func="sum")
-                avg_pts = parser.aggregate(group_by=None, target_col="PTS", func="avg")
-                count_rows = len(pts_list)
-                rows_list = [{
-                    "count_rows": count_rows,
-                    "sum_PTS": total_pts,
-                    "avg_PTS": round(avg_pts, 2) if avg_pts is not None else None
-                }]
-                cols, rows_ = to_table_rows(rows_list, cols=["count_rows", "sum_PTS", "avg_PTS"])
-                result_title = "Global aggregations: COUNT(*), SUM(PTS), AVG(PTS)"
-                columns, rows = cols, rows_
-
-            elif action == "join_teams":
-                # Small in-memory "teams" table to join with
-                teams_meta = [
-                    {"Tm": "LAL", "Region": "West"},
-                    {"Tm": "GSW", "Region": "West"},
-                    {"Tm": "BOS", "Region": "East"},
-                    {"Tm": "MIA", "Region": "East"},
-                    # add more if you like
-                ]
-                joined = parser.join(teams_meta, left_on="Tm", right_on="Tm")
-                # Only keep a few columns for display
-                simplified = []
-                for row in joined:
-                    simplified.append({
-                        "Player": row.get("Player"),
-                        "Tm": row.get("Tm"),
-                        "PTS": row.get("PTS"),
-                        "Region": row.get("Region")
-                    })
-                cols, rows_ = to_table_rows(simplified, cols=["Player", "Tm", "PTS", "Region"])
-                result_title = "Join stats with teams metadata on Tm"
-                columns, rows = cols, rows_
-
-            else:
-                error = "Unknown action."
-
+                    session.modified = True
+                    success = f"Filter added: {filter_col} {filter_op} {filter_val}"
+                
+            elif action == "remove_filter":
+                filter_index = int(request.form.get("filter_index"))
+                removed = query_state['filters'].pop(filter_index)
+                session.modified = True
+                success = f"Filter removed: {removed['column']} {removed['op']} {removed['value']}"
+                
+            elif action == "clear_filters":
+                query_state['filters'] = []
+                session.modified = True
+                success = "All filters cleared"
+                
+            elif action == "update_columns":
+                query_state['show_all_columns'] = 'show_all_columns' in request.form
+                if not query_state['show_all_columns']:
+                    query_state['selected_columns'] = request.form.getlist("selected_columns")
+                session.modified = True
+                success = "Column selection updated"
+                
+            elif action == "update_sort":
+                query_state['sort_column'] = request.form.get("sort_column", "")
+                query_state['sort_order'] = request.form.get("sort_order", "desc")
+                session.modified = True
+                success = "Sorting updated"
+                
+            elif action == "clear_sort":
+                query_state['sort_column'] = ""
+                session.modified = True
+                success = "Sorting removed"
+                
+            elif action == "join_dataset":
+                join_ds = request.form.get("join_dataset")
+                join_left = request.form.get("join_left_col")
+                join_right = request.form.get("join_right_col")
+                
+                if join_ds and join_left and join_right:
+                    # Load join dataset if not already loaded
+                    if join_ds not in parsers:
+                        filepath = os.path.join(DATA_FOLDER, join_ds)
+                        load_dataset_with_progress(filepath, join_ds)
+                    
+                    # Perform join
+                    other_data = parsers[join_ds].data
+                    joined_data = p.join(other_data, join_left, join_right)
+                    
+                    # Store join params
+                    query_state['join_dataset'] = join_ds
+                    query_state['join_left_col'] = join_left
+                    query_state['join_right_col'] = join_right
+                    session.modified = True
+                    
+                    results = joined_data
+                    result_columns = list(joined_data[0].keys()) if joined_data else []
+                    success = f"Joined with {join_ds} on {join_left} = {join_right}"
+                
+            elif action == "clear_join":
+                query_state['join_dataset'] = ''
+                query_state['join_left_col'] = ''
+                query_state['join_right_col'] = ''
+                session.modified = True
+                success = "Join removed"
+                
+            elif action == "execute_query" or action == "clear_all":
+                if action == "clear_all":
+                    session['query_state'] = {
+                        'filters': [],
+                        'selected_columns': [],
+                        'sort_column': '',
+                        'sort_order': 'desc',
+                        'show_all_columns': True,
+                        'join_dataset': '',
+                        'join_left_col': '',
+                        'join_right_col': ''
+                    }
+                    session.modified = True
+                    query_state = get_query_state()
+                    success = "All settings cleared"
+            
+            # Execute query
+            if action != "join_dataset":
+                results, result_columns = execute_query(p, query_state)
+                
         except Exception as e:
-            error = str(e)
-
+            error = f"Error: {str(e)}"
+    
+    # Default: show results with current query state
+    if not results and not error:
+        results, result_columns = execute_query(p, query_state)
+    
     return render_template_string(
-        PAGE,
-        csv_path=CSV_PATH,
-        row_count=len(DATA),
-        col_count=len(COLUMNS),
-        available_cols=", ".join(COLUMNS),
+        PAGE_TEMPLATE,
+        available_datasets=available_datasets,
+        current_dataset=active_dataset,
+        chunk_stats=chunk_stats,
+        query_state=query_state,
         error=error,
-        result_title=result_title,
+        success=success,
+        results=results,
+        result_columns=result_columns,
         columns=columns,
-        rows=rows,
-        row_count_result=len(rows),
+        schema=schema,
+        row_count=row_count,
+        unique_types=unique_types
     )
 
 
 if __name__ == "__main__":
-    APP.run(debug=True)
+    print("\n" + "="*60)
+    print("Starting Enhanced Basketball Stats Query Tool")
+    print("="*60)
+    print(f"Data folder: {DATA_FOLDER}")
+    print("="*60 + "\n")
+    APP.run(debug=True, threaded=True)
