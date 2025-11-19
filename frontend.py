@@ -71,6 +71,7 @@ def load_dataset_with_progress(filepath, dataset_name):
             'chunk_size': 'N/A'
         }
         loading_progress[dataset_name]['status'] = 'complete'
+        loading_progress[dataset_name]['percent'] = 100
     else:
         # Large file - chunked loading
         chunk_stats[dataset_name] = {
@@ -237,28 +238,69 @@ def apply_aggregation(data, aggregation_column, aggregation_function, group_by_c
 
 
 def execute_query(p, state):
-    """Execute the combined query with optimizations"""
-    working_data = p.data
-    columns = list(p.schema.keys())
+    """
+    Execute the combined query pipeline on the *current* logical dataset:
+    JOIN (if any) -> FILTERS -> COLUMN SELECTION -> AGGREGATION -> SORT.
+    
+    Returns:
+        working_data: final rows
+        columns: list of column names in the result
+        aggregation_info: text description of aggregation or None
+        working_schema: schema of the current working dataset (base or joined)
+    """
+    # Start from base data
+    base_data = p.data
+    working_data = base_data
     aggregation_info = None
-    
-    # Ensure state has all required keys
-    if not isinstance(state, dict):
-        state = {}
-    
-    # Step 1: Apply multiple filters
+
+    # Default schema is base schema
+    working_schema = p.schema
+
+    # --- STEP 1: JOIN (if configured) ---
+    join_ds = state.get('join_dataset')
+    join_left = state.get('join_left_col')
+    join_right = state.get('join_right_col')
+
+    if join_ds and join_left and join_right and join_ds in parsers:
+        other_parser = parsers[join_ds]
+
+        # Use CSVParser.join on a temp parser that shares the left data
+        temp_join_parser = CSVParser.__new__(CSVParser)
+        temp_join_parser.data = base_data
+        temp_join_parser.schema = p.schema
+
+        working_data = temp_join_parser.join(other_parser.data, left_on=join_left, right_on=join_right)
+
+        # Infer schema for the joined data
+        temp_schema_parser = CSVParser.__new__(CSVParser)
+        temp_schema_parser.data = working_data
+        if working_data:
+            temp_schema_parser._infer_schema_all_rows()
+            working_schema = temp_schema_parser.schema
+        else:
+            # If join produced no rows, fall back to left schema
+            working_schema = p.schema
+    else:
+        # No join configured or invalid -> just use base
+        working_data = base_data
+        working_schema = p.schema
+
+    # Columns to expose in UI
+    columns = list(working_schema.keys())
+
+    # --- STEP 2: FILTERS ---
     if state.get('filters'):
-        working_data = apply_filters(working_data, state['filters'], p.schema)
-    
-    # Step 2: Apply column selection if not "show all"
+        working_data = apply_filters(working_data, state['filters'], working_schema)
+
+    # --- STEP 3: COLUMN SELECTION ---
     if not state.get('show_all_columns', True) and state.get('selected_columns'):
         temp_parser = CSVParser.__new__(CSVParser)
         temp_parser.data = working_data
-        temp_parser.schema = p.schema
+        temp_parser.schema = working_schema
         working_data = temp_parser.filter_columns(state['selected_columns'])
         columns = state['selected_columns']
-    
-    # Step 3: Apply aggregation if specified
+
+    # --- STEP 4: AGGREGATION ---
     if state.get('aggregation_column') and state.get('aggregation_function'):
         working_data, aggregation_info = apply_aggregation(
             working_data,
@@ -269,15 +311,27 @@ def execute_query(p, state):
         # Update columns based on aggregation result
         if working_data:
             columns = list(working_data[0].keys())
-    
-    # Step 4: Apply sorting if exists (and not aggregated)
+
+    # --- STEP 5: SORTING (skip if aggregation collapsed data) ---
     if state.get('sort_column') and not aggregation_info:
         temp_parser = CSVParser.__new__(CSVParser)
         temp_parser.data = working_data
-        temp_parser.schema = {k: v for k, v in p.schema.items() if k in columns}
-        working_data = temp_parser.sort_data(state['sort_column'], reverse=(state.get('sort_order', 'desc') == 'desc'))
-    
-    return working_data, columns, aggregation_info
+
+        # Infer schema from current working_data so sort_data validates correctly
+        temp_schema_parser = CSVParser.__new__(CSVParser)
+        temp_schema_parser.data = working_data
+        if working_data:
+            temp_schema_parser._infer_schema_all_rows()
+            temp_parser.schema = temp_schema_parser.schema
+        else:
+            temp_parser.schema = working_schema
+
+        working_data = temp_parser.sort_data(
+            state['sort_column'],
+            reverse=(state.get('sort_order', 'desc') == 'desc')
+        )
+
+    return working_data, columns, aggregation_info, working_schema
 
 
 @APP.route("/api/loading_progress/<dataset_name>")
@@ -782,14 +836,6 @@ PAGE_TEMPLATE = r"""
       font-weight: 600;
       color: var(--text);
     }
-
-    .join-section {
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      padding: 12px;
-      background: #f8fafc;
-      margin-bottom: 12px;
-    }
   </style>
 </head>
 <body>
@@ -1062,7 +1108,7 @@ PAGE_TEMPLATE = r"""
               <div class="form-group">
                 <label class="form-label">Join On (Current Dataset)</label>
                 <select name="join_left_col" class="form-select">
-                  {% for col in columns %}
+                  {% for col in schema.keys() %}
                     <option value="{{ col }}" {% if query_state.join_left_col == col %}selected{% endif %}>{{ col }}</option>
                   {% endfor %}
                 </select>
@@ -1287,9 +1333,10 @@ PAGE_TEMPLATE = r"""
             .then(r => r.json())
             .then(progress => {
               if (progress.status === 'loading') {
-                const percent = progress.chunks_processed * 10; // Approximate
-                document.getElementById('progressFill').style.width = Math.min(percent, 99) + '%';
-                document.getElementById('progressFill').textContent = Math.min(percent, 99) + '%';
+                const percent = progress.percent || (progress.chunks_processed * 10); // Approximate if needed
+                const clamped = Math.min(percent, 99);
+                document.getElementById('progressFill').style.width = clamped + '%';
+                document.getElementById('progressFill').textContent = clamped + '%';
                 document.getElementById('loadingStats').textContent = 
                   `Processed ${progress.chunks_processed} chunk(s), ${progress.total_rows} rows loaded...`;
               } else if (progress.status === 'complete') {
@@ -1322,7 +1369,7 @@ PAGE_TEMPLATE = r"""
 
 @APP.route("/", methods=["GET", "POST"])
 def index():
-    """Main route with multi-dataset support, multiple filters, and aggregation"""
+    """Main route with multi-dataset support, multiple filters, join, and aggregation"""
     global active_dataset
     
     # Get or set active dataset
@@ -1367,10 +1414,10 @@ def index():
             unique_types=0
         )
     
+    # Base dataset info
     p = parsers[active_dataset]
     row_count = len(p.data)
     schema = p.get_schema()
-    columns = list(schema.keys())
     unique_types = len(set(schema.values()))
     
     error = None
@@ -1378,6 +1425,7 @@ def index():
     aggregation_info = None
     results = []
     result_columns = []
+    working_schema = schema  # will be replaced by execute_query when join is active
     
     query_state = get_query_state()
     
@@ -1453,19 +1501,12 @@ def index():
                         filepath = os.path.join(DATA_FOLDER, join_ds)
                         load_dataset_with_progress(filepath, join_ds)
                     
-                    # Perform join
-                    other_data = parsers[join_ds].data
-                    joined_data = p.join(other_data, join_left, join_right)
-                    
-                    # Store join params
+                    # Just store join params; the actual join happens inside execute_query()
                     query_state['join_dataset'] = join_ds
                     query_state['join_left_col'] = join_left
                     query_state['join_right_col'] = join_right
                     session.modified = True
-                    
-                    results = joined_data
-                    result_columns = list(joined_data[0].keys()) if joined_data else []
-                    success = f"Joined with {join_ds} on {join_left} = {join_right}"
+                    success = f"Join configured: {join_ds} on {join_left} = {join_right}"
                 
             elif action == "clear_join":
                 query_state['join_dataset'] = ''
@@ -1474,35 +1515,42 @@ def index():
                 session.modified = True
                 success = "Join removed"
                 
-            elif action == "execute_query" or action == "clear_all":
-                if action == "clear_all":
-                    session['query_state'] = {
-                        'filters': [],
-                        'selected_columns': [],
-                        'sort_column': '',
-                        'sort_order': 'desc',
-                        'show_all_columns': True,
-                        'join_dataset': '',
-                        'join_left_col': '',
-                        'join_right_col': '',
-                        'aggregation_column': '',
-                        'aggregation_function': '',
-                        'aggregation_group_by': ''
-                    }
-                    session.modified = True
-                    query_state = get_query_state()
-                    success = "All settings cleared"
+            elif action == "execute_query":
+                # nothing special here; we just recompute using current state
+                success = "Query executed with current settings"
             
-            # Execute query
-            if action != "join_dataset":
-                results, result_columns, aggregation_info = execute_query(p, query_state)
-                
+            elif action == "clear_all":
+                session['query_state'] = {
+                    'filters': [],
+                    'selected_columns': [],
+                    'sort_column': '',
+                    'sort_order': 'desc',
+                    'show_all_columns': True,
+                    'join_dataset': '',
+                    'join_left_col': '',
+                    'join_right_col': '',
+                    'aggregation_column': '',
+                    'aggregation_function': '',
+                    'aggregation_group_by': ''
+                }
+                session.modified = True
+                query_state = get_query_state()
+                success = "All settings cleared"
+            
         except Exception as e:
             error = f"Error: {str(e)}"
     
-    # Default: show results with current query state
-    if not results and not error:
-        results, result_columns, aggregation_info = execute_query(p, query_state)
+    # After handling POST (or for GET), execute the query pipeline
+    if not error:
+        results, result_columns, aggregation_info, working_schema = execute_query(p, query_state)
+    else:
+        results = []
+        result_columns = []
+        aggregation_info = None
+        working_schema = schema
+    
+    # Columns used for filter/column/sort UI should reflect the *working* dataset (joined or base)
+    columns = list(working_schema.keys()) if working_schema else list(schema.keys())
     
     return render_template_string(
         PAGE_TEMPLATE,
@@ -1516,7 +1564,7 @@ def index():
         results=results,
         result_columns=result_columns,
         columns=columns,
-        schema=schema,
+        schema=schema,      # right-hand "Dataset Information" still shows base dataset
         row_count=row_count,
         unique_types=unique_types
     )
