@@ -1,6 +1,5 @@
 import os
 
-# GLOBAL chunk size for scalable filtering + aggregation
 CHUNK_PROCESS_SIZE = 5000  
 
 
@@ -9,9 +8,7 @@ def iter_chunks(data, chunk_size=CHUNK_PROCESS_SIZE):
     for i in range(0, len(data), chunk_size):
         yield data[i:i + chunk_size]
 
-
 class CSVParser:
-    
     def __init__(self, file_path, delimiter=','):
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"CSV file not found: {file_path}")
@@ -19,10 +16,6 @@ class CSVParser:
         self.delimiter = delimiter
         self.data = []
         self.schema = {}
-
-    # ----------------------------------------------------------------------
-    # PARSER HELPERS
-    # ----------------------------------------------------------------------
 
     def _parse_csv_line(self, line):
         fields = []
@@ -66,10 +59,6 @@ class CSVParser:
                 rows.append(self._parse_csv_line(line))
         
         return header, rows
-
-    # ----------------------------------------------------------------------
-    # TYPE INFERENCE
-    # ----------------------------------------------------------------------
 
     def _infer_value_type(self, value):
         if value is None or value.strip() == "":
@@ -115,14 +104,8 @@ class CSVParser:
         
         self.schema = col_types
 
-    # ----------------------------------------------------------------------
-    # PARSE CSV (FULL + CHUNKED)
-    # ----------------------------------------------------------------------
-
     def parse(self, type_inference=True, chunk_size=None):
-        """Parse whole file or chunk generator depending on chunk_size."""
         
-        # -------- FULL PARSE --------
         if chunk_size is None:
             header, rows = self._read_csv_file()
             
@@ -146,7 +129,6 @@ class CSVParser:
             
             return self.data
         
-        # -------- CHUNKED PARSE --------
         else:
             def generator():
                 with open(self.file_path, 'r', encoding='utf-8') as f:
@@ -185,10 +167,6 @@ class CSVParser:
             
             return generator()
 
-    # ----------------------------------------------------------------------
-    # ACCESSORS
-    # ----------------------------------------------------------------------
-
     def __getitem__(self, col):
         if col not in self.schema:
             raise KeyError(f"Column {col} not found")
@@ -203,10 +181,6 @@ class CSVParser:
             raise ValueError(f"Columns not found: {missing}")
         return [{col: row[col] for col in columns} for row in self.data]
 
-    # ----------------------------------------------------------------------
-    # AGGREGATION (non-chunked – chunk logic handled in Flask)
-    # ----------------------------------------------------------------------
-
     def aggregate(self, group_by, target_col, func):
         if target_col not in self.schema and target_col is not None:
             raise ValueError(f"Column {target_col} not found")
@@ -214,7 +188,6 @@ class CSVParser:
         if group_by and group_by not in self.schema:
             raise ValueError(f"Group by column {group_by} not found")
 
-        # ---- GROUP BY MODE ----
         if group_by:
             result = {}
             
@@ -226,7 +199,6 @@ class CSVParser:
                 if v is not None:
                     result[g].append(v)
 
-            # Reduce
             for key, vals in result.items():
                 if func == "sum":
                     result[key] = sum(vals)
@@ -243,7 +215,6 @@ class CSVParser:
 
             return result
 
-        # ---- GLOBAL AGGREGATION ----
         vals = [row[target_col] for row in self.data if row[target_col] is not None]
 
         if func == "sum":
@@ -259,15 +230,10 @@ class CSVParser:
 
         raise ValueError(f"Unsupported function: {func}")
 
-    # ----------------------------------------------------------------------
-    # JOIN
-    # ----------------------------------------------------------------------
-
     def join(self, other_data, left_on, right_on):
         if not other_data or not self.data:
             return []
 
-        # Build right side index
         index = {}
         for row in other_data:
             if right_on not in row:
@@ -275,7 +241,6 @@ class CSVParser:
             key = row[right_on]
             index.setdefault(key, []).append(row)
 
-        # Join
         joined = []
         for row in self.data:
             if left_on not in row:
@@ -288,8 +253,6 @@ class CSVParser:
                     joined.append(merged)
 
         return joined
-
-    # ----------------------------------------------------------------------
 
     def get_data(self):
         return self.data
