@@ -10,7 +10,6 @@ APP.secret_key = 'csv-parser-secret-key-2024'
 DATA_FOLDER = "data"
 parsers = {}
 chunk_stats = {}
-loading_progress = {}
 active_dataset = None
 
 
@@ -28,7 +27,7 @@ def get_chunk_size(file_size_mb):
 
 
 def load_dataset_with_progress(filepath, dataset_name):
-    global parsers, chunk_stats, loading_progress
+    global parsers, chunk_stats
     
     start_time = time.time()
     parser = CSVParser(filepath)
@@ -276,14 +275,6 @@ def execute_query(p, state):
     
     return working_data, columns, aggregation_info, working_schema, total_rows
 
-
-@APP.route("/api/loading_progress/<dataset_name>")
-def get_loading_progress(dataset_name):
-    if dataset_name in loading_progress:
-        return jsonify(loading_progress[dataset_name])
-    return jsonify({'status': 'not_found'})
-
-
 @APP.route("/api/dataset_columns/<dataset_name>")
 def get_dataset_columns(dataset_name):
     if dataset_name in parsers:
@@ -419,7 +410,7 @@ def index():
                 
             elif action == "remove_filter":
                 filter_index = int(request.form.get("filter_index"))
-                removed = query_state['filters'].pop(filter_index)
+                query_state['filters'].pop(filter_index)
                 session.modified = True
                 success = f"Filter removed"
                 
