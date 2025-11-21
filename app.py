@@ -3,7 +3,6 @@ from csv_parser import CSVParser
 import time
 import os
 import glob
-import threading
 
 APP = Flask(__name__)
 APP.secret_key = 'csv-parser-secret-key-2024' 

@@ -398,13 +398,6 @@
             option.value = col;
             option.textContent = col;
             
-            // Re-select previously selected join column
-            {% if query_state.join_right_col %}
-            if (col === '{{ query_state.join_right_col }}') {
-              option.selected = true;
-            }
-            {% endif %}
-            
             rightColSelect.appendChild(option);
           });
         });
@@ -419,7 +412,6 @@
         return;
       }
 
-      // Show loading message
       const btn = event.target;
       btn.disabled = true;
       btn.textContent = 'Loading...';
@@ -431,7 +423,6 @@
       })
       .then(response => response.json())
       .then(data => {
-        // Reload page to display the newly loaded dataset
         window.location.href = '/?dataset=' + dataset; 
       })
       .catch(error => {
@@ -442,14 +433,8 @@
     }
 
     document.addEventListener('DOMContentLoaded', function() {
-      // Initialize state for column selection and limit inputs
       toggleColumnSelection();
       toggleLimitInput();
-
-      {% if query_state.join_dataset %}
-      // Load join columns if a join dataset is already selected
-      loadJoinColumns();
-      {% endif %}
     });
   </script>
 </body>
